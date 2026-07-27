@@ -1,51 +1,113 @@
 #include <Arduino.h>
+#include <ESP32Servo.h>
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 
 /*
 =============================================================================
-        PRUEBA: SENSOR DE COLOR TCS3200 + SENSOR DE DISTANCIA VL53L0X
-                          (ESP32 DevKitC V4)
+                  PROYECTO FINAL: CLASIFICADOR DE OBJETOS XY
 =============================================================================
-Adaptación de sensorcolorMain.c (STM32 HAL) a Arduino/ESP32, más lectura de
-distancia con el sensor ToF GY-VL53L0XV2 por I2C. Reporta por Serial ambas
-lecturas. No incluye motores, servo, electroimán ni sensor IR del proyecto XY
-completo (ver main_xy_completo.cpp.bak en esta misma carpeta para
-restaurarlo).
+Este proyecto implementa el control de:
+- 2 Motores Paso a Paso (NEMA 17) para los ejes X e Y.
+- 1 Servomotor MG90S para subir/bajar el cabezal de agarre.
+- 1 Electroimán gobernado por un transistor MOSFET.
+- 1 Sensor de Distancia ToF VL53L0X (GY-VL53L0XV2, I2C) para detección en el
+  eje Y.
+- 1 Sensor de Color RGB TCS3200 (salida de frecuencia cuadrada).
+- 1 Final de carrera (Endstop) en cada eje (X e Y) para el proceso de Homing.
 
-Conexiones TCS3200 -> ESP32 DevKitC V4:
-  OUT -> GPIO23
-  S0  -> GPIO17   S1 -> GPIO16   (escalado de frecuencia: 20%)
-  S2  -> GPIO18   S3 -> GPIO19   (selección de filtro: rojo/verde/azul/claro)
-  LED -> VCC (3.3V, siempre encendido, ver conversación previa)
-  VCC -> 3.3V     GND -> GND
-
-Conexiones GY-VL53L0XV2 -> ESP32 DevKitC V4 (bus I2C, dirección 0x29):
-  VDD -> 3.3V     GND -> GND
-  SDA -> GPIO21   SCL -> GPIO22
+FLUJO DEL SISTEMA:
+1. Homing Ejes X e Y: Se mueven los carros hacia atrás hasta chocar con los
+   finales de carrera.
+2. Escaneo: El carro X avanza paso a paso mientras el sensor VL53L0X mide la
+   distancia (posición Y) del objeto.
+3. Detección: Si el VL53L0X detecta un objeto dentro del rango útil, se
+   calcula su posición (X, Y) a partir de la distancia medida en mm.
+4. Agarre: El carro se posiciona sobre el objeto, baja el servo, enciende el
+   electroimán y sube el servo.
+5. Lectura de Color: El sensor TCS3200 detecta si el objeto es Rojo, Verde o
+   Azul.
+6. Clasificación: Los motores llevan el objeto al contenedor correspondiente
+   a su color, apagan el electroimán para soltarlo y el sistema vuelve a
+   iniciar el escaneo.
 =============================================================================
 */
 
-// --- Pines del sensor de color TCS3200 ---
-#define TCS_S0   17
-#define TCS_S1   16
-#define TCS_S2   18
-#define TCS_S3   19
-#define TCS_OUT  23
+// ==========================================
+// 1. DEFINICIÓN DE PINES
+// ==========================================
+// --- Motores Paso a Paso (Drivers A4988 / DRV8825) ---
+#define PIN_X_STEP     12
+#define PIN_X_DIR      14
+#define PIN_Y_STEP     26
+#define PIN_Y_DIR      27
 
-// --- Pines del sensor de distancia VL53L0X (I2C) ---
-#define VL53_SDA 21
-#define VL53_SCL 22
+// --- Actuadores auxiliares ---
+#define PIN_SERVO      13   // Servomotor MG90S
+#define PIN_MOSFET_MAG  4   // Control de Electroimán
 
-Adafruit_VL53L0X sensorDistancia = Adafruit_VL53L0X();
-bool vl53Disponible = false;
+// --- Sensores ---
+#define PIN_LIMIT_X    15   // Final de carrera de X (Normalmente Abierto, Pull-up)
+#define PIN_LIMIT_Y    33   // Final de carrera de Y (Normalmente Abierto, Pull-up)
 
-// --- Calibración (portada de sensorcolorMain.c) ---
+// --- Sensor de Distancia VL53L0X (I2C, dirección 0x29) ---
+#define VL53_SDA       21
+#define VL53_SCL       22
+
+// --- Sensor de Color TCS3200 ---
+#define TCS_S0         17
+#define TCS_S1         16
+#define TCS_S2         18
+#define TCS_S3         19
+#define TCS_OUT        23   // Entrada de pulsos de frecuencia
+
+// ==========================================
+// 2. CONSTANTES DE CALIBRACIÓN Y PARÁMETROS
+// ==========================================
+// --- Posiciones de Servomotor ---
+const int SERVO_ANGULO_ARRIBA = 10;   // Cabezal levantado (seguro)
+const int SERVO_ANGULO_ABAJO  = 90;  // Cabezal abajo (agarre)
+
+// --- Relación de transmisión (Pasos por milímetro) ---
+// Para correa GT2 con polea de 20 dientes en un motor de 1.8° por paso (200 pasos/rev):
+// - Sin microstepping (Full step): 200 pasos / 40 mm = 5 pasos/mm
+// - Con 1/2 microstepping: 400 pasos / 40 mm = 10 pasos/mm
+// - Con 1/8 microstepping: 1600 pasos / 40 mm = 40 pasos/mm
+// - Con 1/16 microstepping: 3200 pasos / 40 mm = 80 pasos/mm
+const float PASOS_POR_MM = 80.0;     // Modifica este valor según tus drivers (ej: 80 para 1/16 microstepping)
+
+// --- Límites Físicos del Área de Trabajo (en milímetros) ---
+const float LIMITE_MM_X = 250.0;    // Largo del eje X (250 mm)
+const float LIMITE_MM_Y = 180.0;    // Recorrido útil del eje Y (180 mm)
+
+// --- Posición Física de las Cajas de Clasificación (en milímetros) ---
+const float POS_X_ROJO_MM  = 50.0;   const float POS_Y_ROJO_MM  = 20.0;
+const float POS_X_VERDE_MM = 120.0;  const float POS_Y_VERDE_MM = 20.0;
+const float POS_X_AZUL_MM  = 200.0;  const float POS_Y_AZUL_MM  = 20.0;
+
+// --- CONVERSIÓN AUTOMÁTICA A PASOS (Calculado en tiempo de compilación) ---
+const long LIMITE_PASOS_X = (long)(LIMITE_MM_X * PASOS_POR_MM);
+const long LIMITE_PASOS_Y = (long)(LIMITE_MM_Y * PASOS_POR_MM);
+
+const long POS_X_ROJO  = (long)(POS_X_ROJO_MM  * PASOS_POR_MM);
+const long POS_Y_ROJO  = (long)(POS_Y_ROJO_MM  * PASOS_POR_MM);
+const long POS_X_VERDE = (long)(POS_X_VERDE_MM * PASOS_POR_MM);
+const long POS_Y_VERDE = (long)(POS_Y_VERDE_MM * PASOS_POR_MM);
+const long POS_X_AZUL  = (long)(POS_X_AZUL_MM  * PASOS_POR_MM);
+const long POS_Y_AZUL  = (long)(POS_Y_AZUL_MM  * PASOS_POR_MM);
+
+// --- Rango útil del VL53L0X para considerar que hay un objeto en frente ---
+// Si la distancia medida es mayor a este valor (o la lectura es inválida),
+// se asume que no hay objeto presente en esa posición X del escaneo.
+const float VL53_RANGO_MAX_MM = 150.0;
+
+// --- Calibración del Sensor de Color TCS3200 (portado de sensorcolorMain.c) ---
 // Frecuencia (Hz) leída con una muestra BLANCA (max reflexión, mayor
-// frecuencia) y una NEGRA (min reflexión, menor frecuencia) frente al
-// sensor, con el filtro correspondiente activo. Para calibrar: descomenta
-// los prints de frecuencia cruda, mide con tarjeta blanca y luego negra,
-// y reemplaza estos valores. Los de abajo son solo un punto de partida.
+// frecuencia) y una NEGRA (min reflexión, menor frecuencia) frente al sensor,
+// con el filtro correspondiente activo. Para calibrar: imprime las
+// frecuencias crudas (freqRojo/freqVerde/freqAzul) con una tarjeta blanca y
+// luego una negra frente al sensor, y reemplaza estos valores. Los de abajo
+// son solo un punto de partida.
 #define TCS_RED_MIN     630UL
 #define TCS_RED_MAX    4000UL
 #define TCS_GREEN_MIN   630UL
@@ -53,10 +115,120 @@ bool vl53Disponible = false;
 #define TCS_BLUE_MIN    750UL
 #define TCS_BLUE_MAX   4700UL
 
+// ==========================================
+// 3. VARIABLES DE ESTADO Y OBJETOS
+// ==========================================
+Servo miServo;
+Adafruit_VL53L0X sensorDistancia = Adafruit_VL53L0X();
+bool vl53Disponible = false;
+
+// Estados de la Máquina de Estados
+enum EstadoSistema {
+  ESTADO_HOMING,
+  ESTADO_ESCANEO,
+  ESTADO_GOTO_OBJETO,
+  ESTADO_AGARRE,
+  ESTADO_LORE_COLOR,
+  ESTADO_DEPOSITAR,
+  ESTADO_RETORNO
+};
+
+EstadoSistema estadoActual = ESTADO_HOMING;
+
+long posicionActualX = 0;
+long posicionActualY = 0;
+
+// Variables donde se guardará la posición detectada del objeto
+long objetoDetectadoX = 0;
+long objetoDetectadoY = 0;
+
+// Colores posibles
+enum TipoColor { ROJO, VERDE, AZUL, DESCONOCIDO };
+TipoColor colorDetectado = DESCONOCIDO;
+
+// ==========================================
+// 4. FUNCIONES DE CONTROL DE MOTORES
+// ==========================================
+
+/**
+ * @brief Genera un paso físico en un motor determinado con la dirección indicada.
+ * @param stepPin Pin de STEP
+ * @param dirPin Pin de DIR
+ * @param sentido HIGH para adelante, LOW para atrás
+ * @param delayMicrosegundos Tiempo entre pulsos (controla la velocidad, menor = más rápido)
+ */
+void darPaso(int stepPin, int dirPin, int sentido, int delayMicrosegundos) {
+  digitalWrite(dirPin, sentido);
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(10); // Duración mínima del pulso
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(delayMicrosegundos);
+}
+
+void moverACoordenadas(long xDestino, long yDestino) {
+  // Límites por Software (Soft Limits) para prevenir que la máquina choque en los extremos opuestos
+  xDestino = constrain(xDestino, 0, LIMITE_PASOS_X);
+  yDestino = constrain(yDestino, 0, LIMITE_PASOS_Y);
+
+  Serial.printf("[MOVE] Moviendo a X:%ld, Y:%ld (Actual X:%ld, Y:%ld)\n", xDestino, yDestino, posicionActualX, posicionActualY);
+
+  // --- EJE X ---
+  int dirX = (xDestino >= posicionActualX) ? HIGH : LOW;
+  long pasosX = abs(xDestino - posicionActualX);
+  for (long i = 0; i < pasosX; i++) {
+    // Si vamos hacia atrás (GND/Home) y tocamos el final de carrera, nos detenemos por seguridad.
+    if (dirX == LOW && digitalRead(PIN_LIMIT_X) == LOW) {
+      posicionActualX = 0;
+      break;
+    }
+    darPaso(PIN_X_STEP, PIN_X_DIR, dirX, 1200);
+    posicionActualX += (dirX == HIGH) ? 1 : -1;
+  }
+
+  // --- EJE Y ---
+  int dirY = (yDestino >= posicionActualY) ? HIGH : LOW;
+  long pasosY = abs(yDestino - posicionActualY);
+  for (long i = 0; i < pasosY; i++) {
+    // Si vamos hacia atrás (GND/Home) y tocamos el final de carrera Y, nos detenemos.
+    if (dirY == LOW && digitalRead(PIN_LIMIT_Y) == LOW) {
+      posicionActualY = 0;
+      break;
+    }
+    darPaso(PIN_Y_STEP, PIN_Y_DIR, dirY, 1200);
+    posicionActualY += (dirY == HIGH) ? 1 : -1;
+  }
+}
+
+// ==========================================
+// 5. FUNCIONES DE LECTURA DE SENSORES
+// ==========================================
+
+/**
+ * @brief Lee el sensor de distancia VL53L0X y calcula la posición en pasos
+ * del eje Y a partir de la distancia real medida (en mm).
+ * @param pasosYCalculados Retorna la conversión de distancia medida a pasos
+ * @return true si hay un objeto dentro del rango útil (VL53_RANGO_MAX_MM)
+ */
+bool leerSensorDistancia(long &pasosYCalculados) {
+  if (!vl53Disponible) return false;
+
+  VL53L0X_RangingMeasurementData_t medida;
+  sensorDistancia.rangingTest(&medida, false);
+
+  if (medida.RangeStatus == 4) return false; // 4 = fuera de rango / lectura inválida
+
+  float distanciaMm = medida.RangeMilliMeter;
+  if (distanciaMm > VL53_RANGO_MAX_MM) return false; // nada dentro del área útil
+
+  long pasosCalculados = (long)(distanciaMm * PASOS_POR_MM);
+  pasosYCalculados = constrain(pasosCalculados, 0, LIMITE_PASOS_Y);
+  return true;
+}
+
 /**
  * @brief Mide la frecuencia (Hz) de la señal OUT del TCS3200 sumando la
  * duración del semiciclo alto y bajo (equivale a un periodo completo entre
- * dos flancos de subida). Equivalente en Arduino/ESP32 (pulseIn) de
+ * dos flancos de subida). Es el equivalente en Arduino/ESP32 (pulseIn) de
  * measure_frequency() en sensorcolorMain.c, que usaba Input Capture por
  * hardware (TIM2) en el STM32.
  * @param timeoutUs Tiempo máximo de espera por flanco, en microsegundos.
@@ -84,22 +256,79 @@ uint8_t normalizarTCS3200(uint32_t freq, uint32_t freqMin, uint32_t freqMax) {
   return (uint8_t)(((freq - freqMin) * 255UL) / (freqMax - freqMin));
 }
 
+/**
+ * @brief Lee el sensor TCS3200 (R, G, B) y determina el color predominante.
+ * @return TipoColor (ROJO, VERDE o AZUL)
+ */
+TipoColor obtenerColorTCS3200() {
+  // Configuración de filtros del TCS3200 (S2, S3):
+  // Rojo: S2 = LOW, S3 = LOW
+  // Verde: S2 = HIGH, S3 = HIGH
+  // Azul: S2 = LOW, S3 = HIGH
+  const uint32_t TIMEOUT_US = 20000; // 20ms
+
+  // 1. Leer Componente Roja
+  digitalWrite(TCS_S2, LOW);
+  digitalWrite(TCS_S3, LOW);
+  uint32_t freqRojo = medirFrecuenciaTCS3200(TIMEOUT_US);
+
+  // 2. Leer Componente Verde
+  digitalWrite(TCS_S2, HIGH);
+  digitalWrite(TCS_S3, HIGH);
+  uint32_t freqVerde = medirFrecuenciaTCS3200(TIMEOUT_US);
+
+  // 3. Leer Componente Azul
+  digitalWrite(TCS_S2, LOW);
+  digitalWrite(TCS_S3, HIGH);
+  uint32_t freqAzul = medirFrecuenciaTCS3200(TIMEOUT_US);
+
+  // Si no hubo pulso en ningún canal, el sensor no está viendo nada válido
+  if (freqRojo == 0 && freqVerde == 0 && freqAzul == 0) {
+    Serial.println("[COLOR] Sin lectura (timeout en los 3 canales).");
+    return DESCONOCIDO;
+  }
+
+  uint8_t r = normalizarTCS3200(freqRojo,  TCS_RED_MIN,   TCS_RED_MAX);
+  uint8_t g = normalizarTCS3200(freqVerde, TCS_GREEN_MIN, TCS_GREEN_MAX);
+  uint8_t b = normalizarTCS3200(freqAzul,  TCS_BLUE_MIN,  TCS_BLUE_MAX);
+
+  Serial.printf("[COLOR] R:%u G:%u B:%u (raw %lu,%lu,%lu Hz)\n",
+                r, g, b,
+                (unsigned long)freqRojo, (unsigned long)freqVerde, (unsigned long)freqAzul);
+
+  // El color predominante es el canal normalizado con mayor valor
+  // (a mayor frecuencia, mayor intensidad de reflexión en ese filtro).
+  if (r >= g && r >= b) return ROJO;
+  if (g >= r && g >= b) return VERDE;
+  return AZUL;
+}
+
+// ==========================================
+// SETUP
+// ==========================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("=== SENSOR DE COLOR TCS3200 + SENSOR DE DISTANCIA VL53L0X ===");
+  Serial.println("=== INICIALIZANDO CLASIFICADOR XY ===");
 
-  pinMode(TCS_S0, OUTPUT);
-  pinMode(TCS_S1, OUTPUT);
-  pinMode(TCS_S2, OUTPUT);
-  pinMode(TCS_S3, OUTPUT);
-  pinMode(TCS_OUT, INPUT);
+  // --- Configuración de Motores ---
+  pinMode(PIN_X_STEP, OUTPUT);
+  pinMode(PIN_X_DIR, OUTPUT);
+  pinMode(PIN_Y_STEP, OUTPUT);
+  pinMode(PIN_Y_DIR, OUTPUT);
 
-  // Escalar la frecuencia de salida al 20% (estándar recomendado)
-  digitalWrite(TCS_S0, HIGH);
-  digitalWrite(TCS_S1, LOW);
+  // --- Configuración de Actuadores ---
+  pinMode(PIN_MOSFET_MAG, OUTPUT);
+  digitalWrite(PIN_MOSFET_MAG, LOW); // Electroimán apagado por seguridad
 
-  // --- Inicialización del sensor de distancia VL53L0X ---
+  miServo.attach(PIN_SERVO);
+  miServo.write(SERVO_ANGULO_ARRIBA); // Empezar con el cabezal arriba
+
+  // --- Configuración de Sensores ---
+  pinMode(PIN_LIMIT_X, INPUT_PULLUP);
+  pinMode(PIN_LIMIT_Y, INPUT_PULLUP);
+
+  // --- Configuración del Sensor de Distancia VL53L0X ---
   Wire.begin(VL53_SDA, VL53_SCL);
   if (sensorDistancia.begin()) {
     vl53Disponible = true;
@@ -108,63 +337,191 @@ void setup() {
     vl53Disponible = false;
     Serial.println("ERROR: no se detectó el VL53L0X. Revisa el cableado (SDA/SCL/GND/VDD).");
   }
+
+  // --- Configuración del Sensor de Color ---
+  pinMode(TCS_S0, OUTPUT);
+  pinMode(TCS_S1, OUTPUT);
+  pinMode(TCS_S2, OUTPUT);
+  pinMode(TCS_S3, OUTPUT);
+  pinMode(TCS_OUT, INPUT);
+
+  // Escalar la frecuencia de salida del TCS3200 al 20% (Estándar recomendado)
+  digitalWrite(TCS_S0, HIGH);
+  digitalWrite(TCS_S1, LOW);
 }
 
+// ==========================================
+// BUCLE PRINCIPAL (MÁQUINA DE ESTADOS)
+// ==========================================
 void loop() {
-  const uint32_t TIMEOUT_US = 100000; // 100ms
+  switch (estadoActual) {
 
-  // Rojo: S2=LOW, S3=LOW
-  digitalWrite(TCS_S2, LOW);
-  digitalWrite(TCS_S3, LOW);
-  delay(15);
-  uint32_t freqRojo = medirFrecuenciaTCS3200(TIMEOUT_US);
+    // -------------------------------------------------------------
+    // ESTADO 1: HOMING (Retorno a origen de los ejes X e Y)
+    // -------------------------------------------------------------
+    case ESTADO_HOMING:
+      Serial.println("[MAQUINA] Estado: HOMING Ejes X e Y...");
 
-  // Verde: S2=HIGH, S3=HIGH
-  digitalWrite(TCS_S2, HIGH);
-  digitalWrite(TCS_S3, HIGH);
-  delay(15);
-  uint32_t freqVerde = medirFrecuenciaTCS3200(TIMEOUT_US);
+      // Aseguramos que el electroimán esté apagado y el servo arriba antes del home
+      digitalWrite(PIN_MOSFET_MAG, LOW);
+      miServo.write(SERVO_ANGULO_ARRIBA);
+      delay(500);
 
-  // Azul: S2=LOW, S3=HIGH
-  digitalWrite(TCS_S2, LOW);
-  digitalWrite(TCS_S3, HIGH);
-  delay(15);
-  uint32_t freqAzul = medirFrecuenciaTCS3200(TIMEOUT_US);
+      // 1. Homing Eje Y: Se mueve hacia atrás hasta presionar el Final de Carrera Y
+      Serial.println("[MAQUINA] Homing Eje Y...");
+      while (digitalRead(PIN_LIMIT_Y) == HIGH) {
+        darPaso(PIN_Y_STEP, PIN_Y_DIR, LOW, 2000); // Dirección LOW (Hacia atrás), 2ms por paso
+      }
+      posicionActualY = 0; // Origen Y calibrado
 
-  uint8_t r = normalizarTCS3200(freqRojo,  TCS_RED_MIN,   TCS_RED_MAX);
-  uint8_t g = normalizarTCS3200(freqVerde, TCS_GREEN_MIN, TCS_GREEN_MAX);
-  uint8_t b = normalizarTCS3200(freqAzul,  TCS_BLUE_MIN,  TCS_BLUE_MAX);
+      // 2. Homing Eje X: Se mueve hacia atrás hasta presionar el Final de Carrera X
+      Serial.println("[MAQUINA] Homing Eje X...");
+      while (digitalRead(PIN_LIMIT_X) == HIGH) {
+        darPaso(PIN_X_STEP, PIN_X_DIR, LOW, 2000); // Dirección LOW (Hacia atrás), 2ms por paso
+      }
+      posicionActualX = 0; // Origen X calibrado
 
-  // Color predominante = canal normalizado con mayor valor (a mayor
-  // frecuencia, mayor intensidad de reflexión en ese filtro).
-  const char *colorPredominante;
-  if (freqRojo == 0 && freqVerde == 0 && freqAzul == 0) {
-    colorPredominante = "SIN LECTURA";
-  } else if (r >= g && r >= b) {
-    colorPredominante = "ROJO";
-  } else if (g >= r && g >= b) {
-    colorPredominante = "VERDE";
-  } else {
-    colorPredominante = "AZUL";
+      Serial.println("[MAQUINA] Homing Completado con éxito.");
+      delay(500);
+      estadoActual = ESTADO_ESCANEO;
+      break;
+
+    // -------------------------------------------------------------
+    // ESTADO 2: ESCANEO (Avanzar en X leyendo el sensor de distancia)
+    // -------------------------------------------------------------
+    case ESTADO_ESCANEO:
+      Serial.println("[MAQUINA] Estado: ESCANEO...");
+
+      while (posicionActualX < LIMITE_PASOS_X) {
+        // Dar un paso en X hacia adelante
+        darPaso(PIN_X_STEP, PIN_X_DIR, HIGH, 1500);
+        posicionActualX++;
+
+        // Leer sensor de distancia VL53L0X para estimar posición Y
+        long yCalculado = 0;
+        if (leerSensorDistancia(yCalculado)) {
+          objetoDetectadoX = posicionActualX;
+          objetoDetectadoY = yCalculado;
+          Serial.printf("[DETECCION] Objeto detectado en X: %ld pasos, Y estimado: %ld pasos!\n",
+                        objetoDetectadoX, objetoDetectadoY);
+
+          estadoActual = ESTADO_GOTO_OBJETO;
+          break;
+        }
+      }
+
+      // Si terminamos de recorrer X sin detectar nada, hacemos Home y volvemos a escanear
+      if (estadoActual == ESTADO_ESCANEO) {
+        Serial.println("[MAQUINA] Límite de escaneo X alcanzado sin detecciones. Recomenzando...");
+        estadoActual = ESTADO_HOMING;
+      }
+      break;
+
+    // -------------------------------------------------------------
+    // ESTADO 3: GOTO OBJETO (Moverse a la posición del objeto)
+    // -------------------------------------------------------------
+    case ESTADO_GOTO_OBJETO:
+      Serial.println("[MAQUINA] Estado: IR A LA POSICION DEL OBJETO...");
+      // Nos movemos al punto exacto donde se detectó el objeto
+      moverACoordenadas(objetoDetectadoX, objetoDetectadoY);
+      delay(500);
+      estadoActual = ESTADO_AGARRE;
+      break;
+
+    // -------------------------------------------------------------
+    // ESTADO 4: AGARRE (Bajar servo, activar imán y levantar)
+    // -------------------------------------------------------------
+    case ESTADO_AGARRE:
+      Serial.println("[MAQUINA] Estado: AGARRE Y ACOPLE...");
+
+      // 1. Baja el servomotor para acercar el electroimán y el sensor RGB
+      miServo.write(SERVO_ANGULO_ABAJO);
+      delay(1000); // Esperar a que el servo llegue abajo
+
+      // 2. Activa el Electroimán
+      digitalWrite(PIN_MOSFET_MAG, HIGH);
+      Serial.println("[ACTUADOR] Electroimán ENCENDIDO.");
+      delay(1000); // Dar un segundo para asegurar el acople magnético
+
+      // 3. Levanta el servomotor con el objeto agarrado
+      miServo.write(SERVO_ANGULO_ARRIBA);
+      delay(1000); // Esperar a que el servo levante el objeto
+
+      estadoActual = ESTADO_LORE_COLOR;
+      break;
+
+    // -------------------------------------------------------------
+    // ESTADO 5: LECTURA DE COLOR (Escanear espectro de color)
+    // -------------------------------------------------------------
+    case ESTADO_LORE_COLOR:
+      Serial.println("[MAQUINA] Estado: LECTURA DE COLOR...");
+      colorDetectado = obtenerColorTCS3200();
+
+      switch (colorDetectado) {
+        case ROJO:
+          Serial.println("[COLOR] Detectado color: ROJO.");
+          break;
+        case VERDE:
+          Serial.println("[COLOR] Detectado color: VERDE.");
+          break;
+        case AZUL:
+          Serial.println("[COLOR] Detectado color: AZUL.");
+          break;
+        default:
+          Serial.println("[COLOR] Error: Color no detectado o desconocido. Por defecto: ROJO.");
+          colorDetectado = ROJO; // Acción segura en caso de error
+          break;
+      }
+      estadoActual = ESTADO_DEPOSITAR;
+      break;
+
+    // -------------------------------------------------------------
+    // ESTADO 6: DEPOSITAR (Moverse a la caja y soltar)
+    // -------------------------------------------------------------
+    case ESTADO_DEPOSITAR:
+      Serial.println("[MAQUINA] Estado: CLASIFICAR Y DEPOSITAR...");
+
+      // Seleccionar coordenadas de caja de destino según color
+      long destinoX, destinoY;
+      if (colorDetectado == ROJO) {
+        destinoX = POS_X_ROJO;
+        destinoY = POS_Y_ROJO;
+      } else if (colorDetectado == VERDE) {
+        destinoX = POS_X_VERDE;
+        destinoY = POS_Y_VERDE;
+      } else { // AZUL
+        destinoX = POS_X_AZUL;
+        destinoY = POS_Y_AZUL;
+      }
+
+      // Mover los ejes al contenedor correspondiente
+      moverACoordenadas(destinoX, destinoY);
+      delay(500);
+
+      // Opcional: Bajar un poco el servo para no tirar el objeto desde muy alto
+      miServo.write(SERVO_ANGULO_ABAJO);
+      delay(800);
+
+      // Desactivar el Electroimán para soltar el objeto
+      digitalWrite(PIN_MOSFET_MAG, LOW);
+      Serial.println("[ACTUADOR] Electroimán APAGADO. Objeto liberado.");
+      delay(1000); // Esperar a que caiga
+
+      // Volver a subir el cabezal vacío
+      miServo.write(SERVO_ANGULO_ARRIBA);
+      delay(500);
+
+      estadoActual = ESTADO_RETORNO;
+      break;
+
+    // -------------------------------------------------------------
+    // ESTADO 7: RETORNO (Prepararse para el siguiente ciclo)
+    // -------------------------------------------------------------
+    case ESTADO_RETORNO:
+      Serial.println("[MAQUINA] Estado: REGRESANDO A ORIGEN...");
+      // Volver al punto inicial (Homing) para recalibrar eje X y continuar escaneando
+      estadoActual = ESTADO_HOMING;
+      delay(500);
+      break;
   }
-
-  Serial.printf("Color: %s | R:%u G:%u B:%u (raw %lu,%lu,%lu Hz)\n",
-                colorPredominante, r, g, b,
-                (unsigned long)freqRojo, (unsigned long)freqVerde, (unsigned long)freqAzul);
-
-  // --- Lectura de distancia (VL53L0X) ---
-  if (vl53Disponible) {
-    VL53L0X_RangingMeasurementData_t medida;
-    sensorDistancia.rangingTest(&medida, false);
-
-    if (medida.RangeStatus != 4) { // 4 = fuera de rango / lectura inválida
-      Serial.printf("Distancia: %u mm\n", medida.RangeMilliMeter);
-    } else {
-      Serial.println("Distancia: fuera de rango");
-    }
-  } else {
-    Serial.println("Distancia: sensor VL53L0X no disponible");
-  }
-
-  delay(2000);
 }
