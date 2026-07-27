@@ -3,6 +3,17 @@
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 
+// ==========================================
+// MODO DE PRUEBA DE SENSORES
+// ==========================================
+// 1 = Solo lee e imprime color (TCS3200) y distancia (VL53L0X) por Serial
+//     cada 2s, para verificar que ambos sensores funcionan. No usa ni
+//     configura los pines de motores/servo/electroimán/finales de carrera,
+//     así que sirve aunque solo tengas los sensores conectados.
+// 0 = Corre la máquina de estados completa del clasificador XY (requiere
+//     todo el hardware físicamente armado).
+#define MODO_PRUEBA_SENSORES 1
+
 /*
 =============================================================================
                   PROYECTO FINAL: CLASIFICADOR DE OBJETOS XY
@@ -309,6 +320,10 @@ TipoColor obtenerColorTCS3200() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+#if MODO_PRUEBA_SENSORES
+  Serial.println("=== MODO PRUEBA: SENSOR DE COLOR TCS3200 + SENSOR DE DISTANCIA VL53L0X ===");
+#else
   Serial.println("=== INICIALIZANDO CLASIFICADOR XY ===");
 
   // --- Configuración de Motores ---
@@ -327,6 +342,7 @@ void setup() {
   // --- Configuración de Sensores ---
   pinMode(PIN_LIMIT_X, INPUT_PULLUP);
   pinMode(PIN_LIMIT_Y, INPUT_PULLUP);
+#endif
 
   // --- Configuración del Sensor de Distancia VL53L0X ---
   Wire.begin(VL53_SDA, VL53_SCL);
@@ -351,7 +367,37 @@ void setup() {
 }
 
 // ==========================================
-// BUCLE PRINCIPAL (MÁQUINA DE ESTADOS)
+// BUCLE PRINCIPAL
+// ==========================================
+#if MODO_PRUEBA_SENSORES
+void loop() {
+  // Color: obtenerColorTCS3200() ya imprime R/G/B y frecuencias crudas.
+  TipoColor color = obtenerColorTCS3200();
+  const char *nombreColor = (color == ROJO) ? "ROJO"
+                          : (color == VERDE) ? "VERDE"
+                          : (color == AZUL) ? "AZUL"
+                          : "SIN LECTURA";
+
+  // Distancia: se imprime el valor crudo en mm, sin filtrar por rango,
+  // para poder verificar el sensor a cualquier distancia.
+  if (vl53Disponible) {
+    VL53L0X_RangingMeasurementData_t medida;
+    sensorDistancia.rangingTest(&medida, false);
+    if (medida.RangeStatus != 4) {
+      Serial.printf("[PRUEBA] Color: %s | Distancia: %u mm\n", nombreColor, medida.RangeMilliMeter);
+    } else {
+      Serial.printf("[PRUEBA] Color: %s | Distancia: fuera de rango\n", nombreColor);
+    }
+  } else {
+    Serial.printf("[PRUEBA] Color: %s | Distancia: sensor VL53L0X no disponible\n", nombreColor);
+  }
+
+  delay(2000);
+}
+
+#else
+// ==========================================
+// MÁQUINA DE ESTADOS DEL CLASIFICADOR XY
 // ==========================================
 void loop() {
   switch (estadoActual) {
@@ -525,3 +571,4 @@ void loop() {
       break;
   }
 }
+#endif // MODO_PRUEBA_SENSORES
