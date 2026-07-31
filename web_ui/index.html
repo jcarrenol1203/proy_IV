@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Control Clasificador de Objetos XY - MQTT Global</title>
+  <!-- Google Fonts & Font Awesome Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- MQTT.js Client Library over WebSocket -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Top Bar / Header -->
+  <header class="top-header">
+    <div class="brand">
+      <i class="fa-solid fa-microchip logo-icon"></i>
+      <div>
+        <h1>Clasificador XY <span>MQTT Remote</span></h1>
+        <p class="subtitle">Control y Telemetría en Tiempo Real por Internet</p>
+      </div>
+    </div>
+
+    <!-- Status Badges -->
+    <div class="header-status">
+      <div class="status-badge" id="broker-status-badge">
+        <span class="dot offline" id="broker-dot"></span>
+        <span id="broker-status-text">Broker: Desconectado</span>
+      </div>
+      <div class="status-badge" id="esp-status-badge">
+        <span class="dot offline" id="esp-dot"></span>
+        <span id="esp-status-text">ESP32: Offline</span>
+      </div>
+      <button id="btn-toggle-config" class="icon-btn" title="Configuración de Broker MQTT">
+        <i class="fa-solid fa-gear"></i>
+      </button>
+    </div>
+  </header>
+
+  <!-- Broker Configuration Modal / Drawer -->
+  <div id="config-panel" class="config-panel hidden">
+    <div class="config-content">
+      <h3><i class="fa-solid fa-network-wired"></i> Configuración MQTT Broker</h3>
+      <div class="input-grid">
+        <div class="input-group">
+          <label for="mqtt-host">Host Broker (WSS / WS)</label>
+          <input type="text" id="mqtt-host" value="broker.emqx.io">
+        </div>
+        <div class="input-group">
+          <label for="mqtt-port">Puerto WebSocket</label>
+          <input type="number" id="mqtt-port" value="8084">
+        </div>
+        <div class="input-group">
+          <label for="mqtt-path">Ruta WS Path</label>
+          <input type="text" id="mqtt-path" value="/mqtt">
+        </div>
+        <div class="input-group">
+          <label for="mqtt-proto">Protocolo</label>
+          <select id="mqtt-proto">
+            <option value="wss" selected>wss:// (Seguro SSL/TLS)</option>
+            <option value="ws">ws:// (Estándar)</option>
+          </select>
+        </div>
+        <div class="input-group">
+          <label for="mqtt-topic-ctrl">Tópico Control</label>
+          <input type="text" id="mqtt-topic-ctrl" value="clasificador/control">
+        </div>
+        <div class="input-group">
+          <label for="mqtt-topic-tele">Tópico Telemetría</label>
+          <input type="text" id="mqtt-topic-tele" value="clasificador/telemetry">
+        </div>
+      </div>
+      <div class="config-actions">
+        <button id="btn-reconnect-mqtt" class="btn primary"><i class="fa-solid fa-plug"></i> Reconectar MQTT</button>
+        <button id="btn-close-config" class="btn secondary">Cerrar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Grid Layout -->
+  <main class="dashboard-grid">
+
+    <!-- Column 1: Live Visualization & Machine State -->
+    <section class="panel vis-panel">
+      <div class="panel-header">
+        <h2><i class="fa-solid fa-eye"></i> Visualización en Tiempo Real</h2>
+        <span class="machine-state-tag" id="machine-state-tag">ESTADO: ---</span>
+      </div>
+
+      <!-- Canvas Box -->
+      <div class="canvas-container">
+        <canvas id="machineCanvas" width="760" height="360"></canvas>
+        <div class="canvas-overlay-info">
+          <span><i class="fa-solid fa-ruler-combined"></i> Área de Trabajo: 380mm × 180mm</span>
+          <span><i class="fa-solid fa-bullseye"></i> Posición Cabezal: X: <strong id="canvas-x">0.0</strong> mm | Y: <strong id="canvas-y">0.0</strong> mm</span>
+        </div>
+      </div>
+
+      <!-- Summary Telemetry Cards -->
+      <div class="telemetry-cards">
+        <div class="card">
+          <div class="card-icon"><i class="fa-solid fa-magnet"></i></div>
+          <div class="card-info">
+            <span class="card-label">Electroimán</span>
+            <span class="card-value" id="card-magnet">APAGADO</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-icon"><i class="fa-solid fa-arrows-up-down"></i></div>
+          <div class="card-info">
+            <span class="card-label">Servomotor Cabezal</span>
+            <span class="card-value" id="card-servo">ARRIBA</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-icon"><i class="fa-solid fa-palette"></i></div>
+          <div class="card-info">
+            <span class="card-label">Color Detectado</span>
+            <span class="card-value color-badge" id="card-color">NINGUNO</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-icon"><i class="fa-solid fa-ruler-horizontal"></i></div>
+          <div class="card-info">
+            <span class="card-label">Distancia Sensor Y</span>
+            <span class="card-value" id="card-distance">-- mm</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Classified Bins Counter -->
+      <div class="bins-container">
+        <h3><i class="fa-solid fa-boxes-stacked"></i> Objetos Clasificados</h3>
+        <div class="bins-grid">
+          <div class="bin-card red-bin">
+            <i class="fa-solid fa-cube"></i>
+            <span class="bin-name">Rojo</span>
+            <span class="bin-count" id="count-red">0</span>
+          </div>
+          <div class="bin-card green-bin">
+            <i class="fa-solid fa-cube"></i>
+            <span class="bin-name">Verde</span>
+            <span class="bin-count" id="count-green">0</span>
+          </div>
+          <div class="bin-card blue-bin">
+            <i class="fa-solid fa-cube"></i>
+            <span class="bin-name">Azul</span>
+            <span class="bin-count" id="count-blue">0</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Column 2: Control Panels (Manual & Auto) -->
+    <section class="panel control-panel">
+
+      <!-- Auto Scan & Master Commands -->
+      <div class="control-block">
+        <h2><i class="fa-solid fa-play"></i> Proceso Automático y Escaneo</h2>
+        <div class="btn-group-row">
+          <button id="btn-start-scan" class="btn success btn-lg">
+            <i class="fa-solid fa-play"></i> Iniciar Escaneo
+          </button>
+          <button id="btn-stop-scan" class="btn danger btn-lg">
+            <i class="fa-solid fa-hand"></i> Detener / Pausa
+          </button>
+          <button id="btn-homing" class="btn warning">
+            <i class="fa-solid fa-house"></i> Homing X/Y
+          </button>
+        </div>
+      </div>
+
+      <!-- Manual Electromagnet Control -->
+      <div class="control-block highlighted-block">
+        <h2><i class="fa-solid fa-magnet"></i> Control Manual del Electroimán y Cabezal</h2>
+        
+        <div class="toggle-switches-grid">
+          <!-- Electromagnet Switch -->
+          <div class="toggle-card">
+            <div class="toggle-header">
+              <i class="fa-solid fa-bolt"></i> Electroimán
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="switch-magnet">
+              <span class="slider round"></span>
+            </label>
+            <span class="toggle-status" id="magnet-switch-text">Desactivado</span>
+          </div>
+
+          <!-- Servo Height Switch -->
+          <div class="toggle-card">
+            <div class="toggle-header">
+              <i class="fa-solid fa-arrows-up-down"></i> Altura Cabezal (Servo)
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="switch-servo">
+              <span class="slider round"></span>
+            </label>
+            <span class="toggle-status" id="servo-switch-text">Arriba (Elevado)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Manual Positioning (D-Pad & Custom Move) -->
+      <div class="control-block">
+        <h2><i class="fa-solid fa-arrows-up-down-left-right"></i> Posicionamiento Manual (Ejes X / Y)</h2>
+
+        <!-- Step Selector -->
+        <div class="step-selector">
+          <label>Paso de movimiento:</label>
+          <div class="radio-group">
+            <label class="radio-btn"><input type="radio" name="step_size" value="1"> 1mm</label>
+            <label class="radio-btn"><input type="radio" name="step_size" value="5"> 5mm</label>
+            <label class="radio-btn"><input type="radio" name="step_size" value="10" checked> 10mm</label>
+            <label class="radio-btn"><input type="radio" name="step_size" value="50"> 50mm</label>
+          </div>
+        </div>
+
+        <!-- D-Pad Navigation -->
+        <div class="dpad-container">
+          <div class="dpad">
+            <button id="btn-up-y" class="dpad-btn up" title="Mover Y Adelante"><i class="fa-solid fa-chevron-up"></i> Y+</button>
+            <button id="btn-left-x" class="dpad-btn left" title="Mover X Atrás"><i class="fa-solid fa-chevron-left"></i> X-</button>
+            <button id="btn-center-home" class="dpad-btn center" title="Ir a Origen (0,0)"><i class="fa-solid fa-crosshairs"></i></button>
+            <button id="btn-right-x" class="dpad-btn right" title="Mover X Adelante"><i class="fa-solid fa-chevron-right"></i> X+</button>
+            <button id="btn-down-y" class="dpad-btn down" title="Mover Y Atrás"><i class="fa-solid fa-chevron-down"></i> Y-</button>
+          </div>
+        </div>
+
+        <!-- Absolute Coordinates Direct Move -->
+        <div class="custom-coord-form">
+          <div class="coord-inputs">
+            <div class="coord-field">
+              <label for="input-target-x">X (mm):</label>
+              <input type="number" id="input-target-x" min="0" max="380" step="1" value="50">
+            </div>
+            <div class="coord-field">
+              <label for="input-target-y">Y (mm):</label>
+              <input type="number" id="input-target-y" min="0" max="180" step="1" value="0">
+            </div>
+          </div>
+          <button id="btn-go-to-coord" class="btn primary">
+            <i class="fa-solid fa-location-arrow"></i> Mover a Coordenada (X,Y)
+          </button>
+        </div>
+
+        <div class="aux-actions">
+          <button id="btn-reset-drivers" class="btn secondary sm">
+            <i class="fa-solid fa-rotate-right"></i> Resetear Drivers Motores
+          </button>
+        </div>
+      </div>
+
+      <!-- Log Console -->
+      <div class="control-block console-block">
+        <div class="console-header">
+          <h3><i class="fa-solid fa-terminal"></i> Consola de Eventos y MQTT</h3>
+          <button id="btn-clear-log" class="icon-btn sm" title="Limpiar Consola"><i class="fa-solid fa-trash"></i></button>
+        </div>
+        <div id="logConsole" class="console-body">
+          <div class="log-entry info">[SISTEMA] Interfaz de control iniciada. Conectando al broker...</div>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <footer class="main-footer">
+    <p>Proyecto Clasificador de Objetos por Color XY &copy; 2026 - Conexión MQTT en tiempo real</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
