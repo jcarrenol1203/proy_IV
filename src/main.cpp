@@ -38,6 +38,15 @@
 //     todo el hardware físicamente armado).
 #define MODO_OPERACION 0
 
+// WiFi/MQTT (control remoto + app web) solo se compilan/inicializan en
+// MODO_OPERACION 0. Los modos de prueba 1-5 quedan exactamente igual que
+// antes, sin este stack cargado.
+#if MODO_OPERACION == 0
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#endif
+
 /*
 =============================================================================
                   PROYECTO FINAL: CLASIFICADOR DE OBJETOS XY
@@ -190,6 +199,28 @@ const long POS_Y_LECTURA_COLOR = (long)(POS_Y_LECTURA_COLOR_MM * PASOS_POR_MM);
 // se asume que no hay objeto presente en esa posición X del escaneo.
 const float VL53_RANGO_MAX_MM = 150.0;
 
+// --- Offset de calibración del VL53L0X (en mm) ---
+// El código asume que "distancia medida por el sensor" == "posición Y real
+// del objeto desde el home de Y". Eso solo es cierto si el lente del sensor
+// queda exactamente en el mismo punto físico que el home de Y (Y=0). Si el
+// lente está desplazado unos mm/cm respecto a ese punto, cada posición Y
+// calculada tendrá el mismo error sistemático (el cabezal siempre se pasa,
+// o siempre se queda corto, por la misma cantidad).
+//
+// CÓMO CALIBRAR:
+//   1. Sube el firmware en MODO_OPERACION=1 (imprime distancia cruda cada 2s).
+//   2. Coloca un objeto a una distancia real conocida del sensor (mídela con
+//      una regla/cinta métrica desde el lente del sensor), por ejemplo 100mm.
+//   3. Anota lo que imprime el sensor por Serial para esa distancia real.
+//   4. VL53_OFFSET_MM = (distancia_real_mm) - (distancia_leida_por_sensor_mm).
+//      Si el sensor lee DE MÁS (ej. lee 130 cuando la distancia real es
+//      100mm), el offset debe ser NEGATIVO (-30) para corregirlo.
+//   5. Repite en 2-3 distancias distintas dentro del rango útil para
+//      confirmar que el offset es constante (si varía mucho con la
+//      distancia, el problema no es un offset fijo sino de escala/óptica:
+//      avisa antes de seguir calibrando).
+const float VL53_OFFSET_MM = 0.0;
+
 // --- Pasos de X entre cada lectura del VL53L0X durante el escaneo ---
 // El VL53L0X tarda ~30-50ms por medición; leerlo en cada paso individual
 // frena el escaneo. Con 40 pasos/mm, 40 pasos = 1mm de resolución espacial
@@ -225,7 +256,14 @@ enum EstadoSistema {
   ESTADO_AGARRE,
   ESTADO_LORE_COLOR,
   ESTADO_DEPOSITAR,
-  ESTADO_RETORNO
+  ESTADO_RETORNO,
+#if MODO_OPERACION == 0
+  // Estado de pausa: solo se entra aquí si llega un comando MQTT "STOP".
+  // El ciclo automático original (HOMING->ESCANEO->...->RETORNO->ESCANEO)
+  // nunca lo visita por sí solo, así que sin WiFi/MQTT el comportamiento
+  // es idéntico al de siempre.
+  ESTADO_MANUAL,
+#endif
 };
 
 EstadoSistema estadoActual = ESTADO_HOMING;
@@ -240,6 +278,41 @@ long objetoDetectadoY = 0;
 // Colores posibles
 enum TipoColor { ROJO, VERDE, AZUL, DESCONOCIDO };
 TipoColor colorDetectado = DESCONOCIDO;
+
+#if MODO_OPERACION == 0
+// ==========================================
+// 3.1 WIFI + MQTT (control remoto / app web, opcional)
+// ==========================================
+// Reemplaza con el SSID/clave de tu red WiFi local (2.4 GHz). Si se dejan
+// los valores de ejemplo, conectarWiFi() simplemente fallará tras ~10s y el
+// sistema sigue funcionando 100% autónomo por Serial, igual que siempre.
+const char* WIFI_SSID = "Comunidad_UNMED";
+const char* WIFI_PASS = "wifi_med_213";
+
+// Broker MQTT público de ejemplo (broker.emqx.io, broker.hivemq.com,
+// test.mosquitto.org). Para uso real, monta tu propio broker.
+const char* MQTT_BROKER          = "broker.emqx.io";
+const int   MQTT_PORT            = 1883;
+const char* MQTT_TOPIC_CONTROL   = "clasificador/control";
+const char* MQTT_TOPIC_TELEMETRY = "clasificador/telemetry";
+const char* MQTT_TOPIC_STATUS    = "clasificador/status";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+unsigned long ultimoEnvioTelemetria = 0;
+const unsigned long INTERVALO_TELEMETRIA_MS = 300;
+
+// Espejos de estado solo para telemetría (la lógica real de agarre/color
+// sigue gobernada por digitalWrite(PIN_MOSFET_MAG,...) / miServo.write(...)
+// exactamente como antes; estas variables solo reflejan esas llamadas para
+// poder publicarlas por MQTT).
+bool electroimanEstadoMQTT = false;
+bool servoAbajoMQTT = false;
+int contadorRojo = 0;
+int contadorVerde = 0;
+int contadorAzul = 0;
+uint16_t ultimaDistanciaMmMQTT = 0;
+#endif
 
 // ==========================================
 // 4. FUNCIONES DE CONTROL DE MOTORES
@@ -378,6 +451,28 @@ void imprimirZonas() {
                 POS_Y_LECTURA_COLOR, POS_Y_LECTURA_COLOR_MM);
 }
 
+// --- Rampa del servo (arranque suave) ---
+// Un servo bajo carga consume su pico de corriente más alto justo al
+// arrancar el movimiento (corriente de arranque/stall), no mientras ya está
+// en marcha. Saltar de golpe de SERVO_ANGULO_ABAJO a SERVO_ANGULO_ARRIBA con
+// el objeto ya pegado exige ese pico de golpe; moverlo en pasos pequeños
+// reparte la demanda de corriente en el tiempo y baja el pico instantáneo,
+// lo que puede ser la diferencia entre "alcanza" y "se queda abajo" cuando
+// la alimentación es justa.
+const int SERVO_PASO_RAMPA_GRADOS = 5;
+const int SERVO_DELAY_PASO_RAMPA_MS = 25;
+
+void moverServoGradual(int anguloDestino) {
+  int anguloActual = miServo.read(); // último ángulo escrito (sin sensor de posición real)
+  int paso = (anguloDestino >= anguloActual) ? SERVO_PASO_RAMPA_GRADOS : -SERVO_PASO_RAMPA_GRADOS;
+
+  for (int a = anguloActual; (paso > 0) ? (a < anguloDestino) : (a > anguloDestino); a += paso) {
+    miServo.write(a);
+    delay(SERVO_DELAY_PASO_RAMPA_MS);
+  }
+  miServo.write(anguloDestino);
+}
+
 // ==========================================
 // 5. FUNCIONES DE LECTURA DE SENSORES
 // ==========================================
@@ -400,9 +495,15 @@ bool leerSensorDistancia(long &pasosYCalculados) {
   if (medida.RangeStatus == 4) return false; // 4 = fuera de rango / lectura inválida
 
   float distanciaMm = medida.RangeMilliMeter;
-  if (distanciaMm > VL53_RANGO_MAX_MM || distanciaMm > LIMITE_MM_Y) return false; // fuera del area util o de la zona de operacion
+  Serial.printf("[VL53 RAW] %.0f mm (RangeStatus:%d)\n", distanciaMm, medida.RangeStatus);
+#if MODO_OPERACION == 0
+  ultimaDistanciaMmMQTT = (uint16_t)distanciaMm;
+#endif
 
-  long pasosCalculados = (long)(distanciaMm * PASOS_POR_MM);
+  float distanciaCorregidaMm = distanciaMm + VL53_OFFSET_MM;
+  if (distanciaCorregidaMm > VL53_RANGO_MAX_MM || distanciaCorregidaMm > LIMITE_MM_Y) return false; // fuera del area util o de la zona de operacion
+
+  long pasosCalculados = (long)(distanciaCorregidaMm * PASOS_POR_MM);
   pasosYCalculados = constrain(pasosCalculados, 0, LIMITE_PASOS_Y);
   return true;
 }
@@ -484,6 +585,152 @@ TipoColor obtenerColorTCS3200() {
   if (g >= r && g >= b) return VERDE;
   return AZUL;
 }
+
+#if MODO_OPERACION == 0
+// ==========================================
+// 6. WIFI + MQTT (control remoto / app web, opcional)
+// ==========================================
+const char* getEstadoNombre(EstadoSistema e) {
+  switch (e) {
+    case ESTADO_HOMING: return "HOMING";
+    case ESTADO_ESCANEO: return "ESCANEO";
+    case ESTADO_GOTO_OBJETO: return "GOTO_OBJETO";
+    case ESTADO_AGARRE: return "AGARRE";
+    case ESTADO_LORE_COLOR: return "LECTURA_COLOR";
+    case ESTADO_DEPOSITAR: return "DEPOSITAR";
+    case ESTADO_RETORNO: return "RETORNO";
+    case ESTADO_MANUAL: return "MANUAL";
+    default: return "DESCONOCIDO";
+  }
+}
+
+const char* getColorNombre(TipoColor c) {
+  switch (c) {
+    case ROJO: return "ROJO";
+    case VERDE: return "VERDE";
+    case AZUL: return "AZUL";
+    default: return "DESCONOCIDO";
+  }
+}
+
+/**
+ * @brief Publica el estado actual del sistema por MQTT (topic de
+ * telemetría). Es puramente informativo: no cambia nada de la máquina de
+ * estados, solo reporta lo que ya está pasando.
+ */
+void publicarTelemetria() {
+  if (!mqttClient.connected()) return;
+
+  JsonDocument doc;
+  doc["state"] = getEstadoNombre(estadoActual);
+  doc["x_mm"] = posicionActualX / PASOS_POR_MM;
+  doc["y_mm"] = posicionActualY / PASOS_POR_MM;
+  doc["magnet"] = electroimanEstadoMQTT;
+  doc["servo"] = servoAbajoMQTT ? "ABAJO" : "ARRIBA";
+  doc["dist_mm"] = ultimaDistanciaMmMQTT;
+  doc["color"] = getColorNombre(colorDetectado);
+  doc["counts"]["red"] = contadorRojo;
+  doc["counts"]["green"] = contadorVerde;
+  doc["counts"]["blue"] = contadorAzul;
+
+  char buffer[384];
+  serializeJson(doc, buffer);
+  mqttClient.publish(MQTT_TOPIC_TELEMETRY, buffer);
+}
+
+/**
+ * @brief Comandos remotos aceptados por MQTT (topic de control). Solo
+ * START_SCAN/STOP/HOMING tocan la máquina de estados; MAGNET/SERVO/MOVE son
+ * overrides manuales pensados para usarse con el sistema detenido
+ * (ESTADO_MANUAL), no durante el ciclo automático.
+ */
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.println("[MQTT] Error al parsear JSON de comando.");
+    return;
+  }
+
+  const char* cmd = doc["cmd"];
+  if (!cmd) return;
+
+  Serial.printf("[MQTT RX] Comando: %s\n", cmd);
+
+  if (strcmp(cmd, "START_SCAN") == 0) {
+    estadoActual = ESTADO_ESCANEO;
+  } else if (strcmp(cmd, "STOP") == 0) {
+    estadoActual = ESTADO_MANUAL;
+  } else if (strcmp(cmd, "HOMING") == 0) {
+    estadoActual = ESTADO_HOMING;
+  } else if (strcmp(cmd, "MAGNET") == 0) {
+    bool state = doc["state"];
+    electroimanEstadoMQTT = state;
+    digitalWrite(PIN_MOSFET_MAG, state ? HIGH : LOW);
+    Serial.printf("[ELECTROIMAN] Control manual (MQTT): %s\n", state ? "ENCENDIDO" : "APAGADO");
+  } else if (strcmp(cmd, "SERVO") == 0) {
+    const char* sState = doc["state"];
+    if (sState && (strcmp(sState, "DOWN") == 0 || strcmp(sState, "ABAJO") == 0)) {
+      miServo.write(SERVO_ANGULO_ABAJO);
+      servoAbajoMQTT = true;
+    } else {
+      miServo.write(SERVO_ANGULO_ARRIBA);
+      servoAbajoMQTT = false;
+    }
+  } else if (strcmp(cmd, "MOVE") == 0 && doc["x"].is<float>() && doc["y"].is<float>()) {
+    float xMm = doc["x"];
+    float yMm = doc["y"];
+    moverACoordenadas((long)(xMm * PASOS_POR_MM), (long)(yMm * PASOS_POR_MM));
+  } else if (strcmp(cmd, "MOVE_REL") == 0) {
+    float dx = doc["dx"] | 0.0;
+    float dy = doc["dy"] | 0.0;
+    moverACoordenadas(posicionActualX + (long)(dx * PASOS_POR_MM),
+                       posicionActualY + (long)(dy * PASOS_POR_MM));
+  } else if (strcmp(cmd, "RESET_DRIVERS") == 0) {
+    resetControladoresMotor();
+  }
+
+  publicarTelemetria();
+}
+
+void reconectarMQTT() {
+  if (mqttClient.connected()) return;
+  Serial.print("[MQTT] Conectando a broker...");
+  String clientId = "ESP32Clasificador-" + String(random(0xffff), HEX);
+  if (mqttClient.connect(clientId.c_str())) {
+    Serial.println(" conectado.");
+    mqttClient.subscribe(MQTT_TOPIC_CONTROL);
+    mqttClient.publish(MQTT_TOPIC_STATUS, "{\"online\":true}");
+  } else {
+    Serial.printf(" falló (estado %d), se reintenta en el próximo ciclo.\n", mqttClient.state());
+  }
+}
+
+/**
+ * @brief Intenta conectar a la red WiFi configurada arriba (WIFI_SSID /
+ * WIFI_PASS). Si falla (ej. quedaron los valores de ejemplo), se rinde tras
+ * ~10s y el sistema sigue funcionando en modo local, igual que si esta
+ * función no existiera.
+ */
+void conectarWiFi() {
+  Serial.printf("[WIFI] Conectando a %s...", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 20) {
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Conectado. IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WIFI] No se pudo conectar. Operando en modo local (sin app/MQTT).");
+  }
+}
+#endif // MODO_OPERACION == 0
 
 // ==========================================
 // SETUP
@@ -599,6 +846,21 @@ void setup() {
   // Escalar la frecuencia de salida del TCS3200 al 20% (Estándar recomendado)
   digitalWrite(TCS_S0, HIGH);
   digitalWrite(TCS_S1, LOW);
+
+#if MODO_OPERACION == 0
+  // --- WiFi + MQTT (opcional): se intenta al final, después de que todo el
+  // hardware físico ya quedó exactamente igual que en la versión sin app.
+  // Si no hay red configurada o el broker no responde, esto no bloquea ni
+  // altera el arranque de la máquina de estados (que sigue empezando en
+  // ESTADO_HOMING como siempre).
+  conectarWiFi();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(callbackMQTT);
+  mqttClient.setBufferSize(512);
+  if (WiFi.status() == WL_CONNECTED) {
+    reconectarMQTT();
+  }
+#endif
 }
 
 // ==========================================
@@ -703,11 +965,11 @@ void loop() {
 // PRUEBA DEL SERVOMOTOR MG90S
 // ==========================================
 void loop() {
-  Serial.println("[SERVO] -> ARRIBA (10 grados)");
+  Serial.printf("[SERVO] -> ARRIBA (%d grados)\n", SERVO_ANGULO_ARRIBA);
   miServo.write(SERVO_ANGULO_ARRIBA);
   delay(1000);
 
-  Serial.println("[SERVO] -> ABAJO (90 grados)");
+  Serial.printf("[SERVO] -> ABAJO (%d grados)\n", SERVO_ANGULO_ABAJO);
   miServo.write(SERVO_ANGULO_ABAJO);
   delay(1000);
 }
@@ -743,7 +1005,25 @@ void loop() {
 // MÁQUINA DE ESTADOS DEL CLASIFICADOR XY
 // ==========================================
 void loop() {
+  // --- Mantenimiento WiFi/MQTT (no altera la máquina de estados) ---
+  if (WiFi.status() == WL_CONNECTED) {
+    reconectarMQTT();
+    mqttClient.loop(); // procesa mensajes entrantes -> puede invocar callbackMQTT()
+  }
+  if (millis() - ultimoEnvioTelemetria > INTERVALO_TELEMETRIA_MS) {
+    ultimoEnvioTelemetria = millis();
+    publicarTelemetria();
+  }
+
   switch (estadoActual) {
+
+    // -------------------------------------------------------------
+    // ESTADO MANUAL: espera comandos MQTT/Serial. Solo se llega aquí si
+    // llegó un "STOP" por MQTT; el ciclo automático nunca lo visita solo.
+    // -------------------------------------------------------------
+    case ESTADO_MANUAL:
+      delay(20);
+      break;
 
     // -------------------------------------------------------------
     // ESTADO 1: HOMING (Retorno a origen de los ejes X e Y)
@@ -753,7 +1033,9 @@ void loop() {
 
       // Aseguramos que el electroimán esté apagado y el servo arriba antes del home
       digitalWrite(PIN_MOSFET_MAG, LOW);
+      electroimanEstadoMQTT = false;
       miServo.write(SERVO_ANGULO_ARRIBA);
+      servoAbajoMQTT = false;
       delay(500);
 
       homingXY();
@@ -773,7 +1055,7 @@ void loop() {
         moverACoordenadas(POS_X_INICIO_ESCANEO, posicionActualY);
       }
 
-      while (posicionActualX < LIMITE_PASOS_X) {
+      while (posicionActualX < LIMITE_PASOS_X && estadoActual == ESTADO_ESCANEO) {
         // Dar varios pasos seguidos en X antes de volver a leer el sensor:
         // el VL53L0X tarda ~30-50ms por medición, así que leerlo en CADA
         // paso individual frena el escaneo a paso de tortuga. Se agrupan
@@ -782,6 +1064,11 @@ void loop() {
           darPaso(PIN_X_STEP, PIN_X_DIR, DIR_X_ADELANTE, 1500);
           posicionActualX++;
         }
+
+        // Deja que MQTT procese un posible "STOP" sin frenar el escaneo
+        // (el escaneo completo puede tardar varios segundos en un solo
+        // paso por loop(), y sin esto el broker no vería señales de vida).
+        if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
 
         // Leer sensor de distancia VL53L0X para estimar posición Y
         long yCalculado = 0;
@@ -822,16 +1109,33 @@ void loop() {
 
       // 1. Baja el servomotor para acercar el electroimán al objeto
       miServo.write(SERVO_ANGULO_ABAJO);
+      servoAbajoMQTT = true;
       delay(1000); // Esperar a que el servo llegue abajo
 
       // 2. Activa el Electroimán
       digitalWrite(PIN_MOSFET_MAG, HIGH);
+      electroimanEstadoMQTT = true;
       Serial.println("[ACTUADOR] Electroimán ENCENDIDO.");
       delay(1000); // Dar un segundo para asegurar el acople magnético
 
-      // 3. Levanta el servomotor con el objeto agarrado
-      miServo.write(SERVO_ANGULO_ARRIBA);
-      delay(1000); // Esperar a que el servo levante el objeto
+      // 3. Levanta el servomotor con el objeto agarrado (se mantiene arriba
+      // hasta ESTADO_DEPOSITAR: no se vuelve a tocar el servo entre aquí y ahí)
+      //
+      // Los drivers de los NEMA17 mantienen corriente de sostenimiento todo
+      // el tiempo que están habilitados, incluso quietos, compitiendo por la
+      // misma alimentación que el servo (comparten riel). Justo aquí es
+      // donde el servo necesita más corriente para levantar el objeto, así
+      // que se duermen los drivers (sin soltar la posición de los ejes,
+      // solo cortan su corriente de sostenimiento) mientras dura el
+      // levantamiento, y se reactivan antes de volver a mover algún eje.
+      // Además se sube en rampa (no de golpe) para repartir el pico de
+      // corriente de arranque del servo en vez de pedirlo todo de una vez.
+      digitalWrite(PIN_MOTOR_RESET, LOW);
+      moverServoGradual(SERVO_ANGULO_ARRIBA);
+      servoAbajoMQTT = false;
+      delay(500); // Margen extra por si el servo quedó forcejeando al final de la rampa
+      digitalWrite(PIN_MOTOR_RESET, HIGH);
+      delay(10); // Pequeño margen para que los drivers se reactiven antes de dar pasos
 
       // 4. El sensor TCS3200 está anclado cerca del home de Y (no viaja con
       // el cabezal), así que hay que acercar el objeto hasta ahí para leerlo.
@@ -847,6 +1151,7 @@ void loop() {
     case ESTADO_LORE_COLOR:
       Serial.println("[MAQUINA] Estado: LECTURA DE COLOR...");
       colorDetectado = obtenerColorTCS3200();
+      publicarTelemetria();
 
       switch (colorDetectado) {
         case ROJO:
@@ -877,12 +1182,15 @@ void loop() {
       if (colorDetectado == ROJO) {
         destinoX = POS_X_ROJO;
         destinoY = POS_Y_ROJO;
+        contadorRojo++;
       } else if (colorDetectado == VERDE) {
         destinoX = POS_X_VERDE;
         destinoY = POS_Y_VERDE;
+        contadorVerde++;
       } else { // AZUL
         destinoX = POS_X_AZUL;
         destinoY = POS_Y_AZUL;
+        contadorAzul++;
       }
 
       // Mover los ejes al contenedor correspondiente
@@ -891,17 +1199,21 @@ void loop() {
 
       // Opcional: Bajar un poco el servo para no tirar el objeto desde muy alto
       miServo.write(SERVO_ANGULO_ABAJO);
+      servoAbajoMQTT = true;
       delay(800);
 
       // Desactivar el Electroimán para soltar el objeto
       digitalWrite(PIN_MOSFET_MAG, LOW);
+      electroimanEstadoMQTT = false;
       Serial.println("[ACTUADOR] Electroimán APAGADO. Objeto liberado.");
       delay(1000); // Esperar a que caiga
 
       // Volver a subir el cabezal vacío
       miServo.write(SERVO_ANGULO_ARRIBA);
+      servoAbajoMQTT = false;
       delay(500);
 
+      publicarTelemetria();
       estadoActual = ESTADO_RETORNO;
       break;
 

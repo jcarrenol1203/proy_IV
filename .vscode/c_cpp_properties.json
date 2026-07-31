@@ -10,6 +10,9 @@
             "includePath": [
                 "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/include",
                 "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/src",
+                "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
+                "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/ArduinoJson/src",
+                "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/PubSubClient/src",
                 "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/Adafruit_VL53L0X/src",
                 "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                 "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/ESP32Servo/src",
@@ -241,7 +244,6 @@
                 "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/USB/src",
                 "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/Update/src",
                 "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src",
-                "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                 "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                 "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFiProv/src",
                 ""
@@ -251,6 +253,9 @@
                 "path": [
                     "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/include",
                     "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/src",
+                    "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
+                    "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/ArduinoJson/src",
+                    "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/PubSubClient/src",
                     "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/Adafruit_VL53L0X/src",
                     "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src",
                     "/home/jacl/Documentos/PlatformIO/Projects/proyecto_final/.pio/libdeps/esp32dev/ESP32Servo/src",
@@ -482,7 +487,6 @@
                     "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/USB/src",
                     "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/Update/src",
                     "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src",
-                    "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                     "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                     "/home/jacl/.platformio/packages/framework-arduinoespressif32/libraries/WiFiProv/src",
                     ""
