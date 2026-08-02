@@ -30,6 +30,7 @@ let systemState = {
   servo: 'ARRIBA',
   color: 'DESCONOCIDO',
   distanceMm: 0,
+  yFineOffsetMm: 0,
   counts: { red: 0, green: 0, blue: 0 }
 };
 
@@ -138,6 +139,7 @@ function handleTelemetryMessage(data) {
   if (data.servo !== undefined) systemState.servo = data.servo;
   if (data.color !== undefined) systemState.color = data.color;
   if (data.dist_mm !== undefined) systemState.distanceMm = data.dist_mm;
+  if (data.y_fine_offset_mm !== undefined) systemState.yFineOffsetMm = parseFloat(data.y_fine_offset_mm);
   if (data.counts) {
     systemState.counts.red = data.counts.red || 0;
     systemState.counts.green = data.counts.green || 0;
@@ -166,6 +168,12 @@ function updateDashboardUI() {
 
   const servoCard = document.getElementById('card-servo');
   servoCard.textContent = systemState.servo;
+
+  // Fine Y offset display (solo si el usuario no lo está editando activamente
+  // no aplica aquí: son botones +/-, no un input de texto, así que siempre
+  // se sincroniza con lo último que confirmó el ESP32)
+  const fineOffsetDisplay = document.getElementById('fine-offset-display');
+  if (fineOffsetDisplay) fineOffsetDisplay.textContent = systemState.yFineOffsetMm.toFixed(1);
 
   const distanceCard = document.getElementById('card-distance');
   distanceCard.textContent = `${systemState.distanceMm} mm`;
@@ -460,6 +468,23 @@ function initUIEventListeners() {
     }
 
     sendCommand({ cmd: 'MOVE', x: targetX, y: targetY });
+  });
+
+  // Fine Y Offset (+/-) & Retry Grab
+  document.getElementById('btn-offset-plus').addEventListener('click', () => {
+    systemState.yFineOffsetMm += 1;
+    document.getElementById('fine-offset-display').textContent = systemState.yFineOffsetMm.toFixed(1);
+    sendCommand({ cmd: 'SET_Y_OFFSET', value: systemState.yFineOffsetMm });
+  });
+
+  document.getElementById('btn-offset-minus').addEventListener('click', () => {
+    systemState.yFineOffsetMm -= 1;
+    document.getElementById('fine-offset-display').textContent = systemState.yFineOffsetMm.toFixed(1);
+    sendCommand({ cmd: 'SET_Y_OFFSET', value: systemState.yFineOffsetMm });
+  });
+
+  document.getElementById('btn-retry-grab').addEventListener('click', () => {
+    sendCommand({ cmd: 'RETRY_GRAB' });
   });
 
   // Reset Motor Drivers Button

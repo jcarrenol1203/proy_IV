@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <!-- MQTT.js Client Library over WebSocket -->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=2">
 </head>
 <body>
 
@@ -208,6 +208,22 @@
         </div>
       </div>
 
+      <!-- Grab Calibration: fine Y offset + retry -->
+      <div class="control-block highlighted-block">
+        <h2><i class="fa-solid fa-sliders"></i> Calibración de Agarre</h2>
+        <p class="calib-hint">Si el electroimán se queda por poco sin agarrar la tapa, ajusta este valor y presiona "Reintentar" para repetir el último intento con la corrección aplicada (sin volver a escanear).</p>
+        <div class="fine-offset-row">
+          <button id="btn-offset-minus" class="btn secondary sm"><i class="fa-solid fa-minus"></i> 1mm</button>
+          <div class="fine-offset-value">
+            <span id="fine-offset-display">0.0</span> mm
+          </div>
+          <button id="btn-offset-plus" class="btn secondary sm"><i class="fa-solid fa-plus"></i> 1mm</button>
+        </div>
+        <button id="btn-retry-grab" class="btn danger btn-lg">
+          <i class="fa-solid fa-rotate"></i> No lo recogió - Reintentar
+        </button>
+      </div>
+
       <!-- Manual Positioning (D-Pad & Custom Move) -->
       <div class="control-block">
         <h2><i class="fa-solid fa-arrows-up-down-left-right"></i> Posicionamiento Manual (Ejes X / Y)</h2>
@@ -277,6 +293,6 @@
     <p>Proyecto Clasificador de Objetos por Color XY &copy; 2026 - Conexión MQTT en tiempo real</p>
   </footer>
 
-  <script src="app.js?v=2"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>

@@ -517,6 +517,32 @@ canvas {
   gap: 0.4rem;
 }
 
+.calib-hint {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.fine-offset-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.fine-offset-value {
+  min-width: 90px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--accent-cyan);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.8rem;
+}
+
 .toggle-status {
   font-size: 0.8rem;
   color: var(--text-muted);
