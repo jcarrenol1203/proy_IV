@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <!-- MQTT.js Client Library over WebSocket -->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
-  <link rel="stylesheet" href="style.css?v=2">
+  <link rel="stylesheet" href="style.css?v=3">
 </head>
 <body>
 
@@ -224,6 +224,18 @@
         </button>
       </div>
 
+      <!-- Manual Destination Bin Override -->
+      <div class="control-block">
+        <h2><i class="fa-solid fa-box-open"></i> Caja Destino</h2>
+        <p class="calib-hint">Por defecto va a la caja del color detectado. Elige una para forzar el destino del próximo objeto que deposite (ignora el color leído), o vuelve a "Auto" para que decida el sensor.</p>
+        <div class="destino-group" id="destino-group">
+          <button class="btn destino-btn active" data-destino="AUTO"><i class="fa-solid fa-wand-magic-sparkles"></i> Auto</button>
+          <button class="btn destino-btn destino-rojo" data-destino="ROJO"><i class="fa-solid fa-cube"></i> Rojo</button>
+          <button class="btn destino-btn destino-verde" data-destino="VERDE"><i class="fa-solid fa-cube"></i> Verde</button>
+          <button class="btn destino-btn destino-azul" data-destino="AZUL"><i class="fa-solid fa-cube"></i> Azul</button>
+        </div>
+      </div>
+
       <!-- Manual Positioning (D-Pad & Custom Move) -->
       <div class="control-block">
         <h2><i class="fa-solid fa-arrows-up-down-left-right"></i> Posicionamiento Manual (Ejes X / Y)</h2>
@@ -293,6 +305,6 @@
     <p>Proyecto Clasificador de Objetos por Color XY &copy; 2026 - Conexión MQTT en tiempo real</p>
   </footer>
 
-  <script src="app.js?v=3"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>

@@ -134,7 +134,18 @@ FLUJO DEL SISTEMA:
 // ==========================================
 // --- Posiciones de Servomotor ---
 const int SERVO_ANGULO_ARRIBA = 90;   // Cabezal levantado (seguro)
-const int SERVO_ANGULO_ABAJO  = 10;  // Cabezal abajo (agarre)
+const int SERVO_ANGULO_ABAJO  = 8;   // Cabezal abajo (agarre)
+const int SERVO_ANGULO_LECTURA_COLOR = 120;  // Altura calibrada para que el TCS3200 lea bien el objeto agarrado
+
+// --- Rampa del servo al levantar con el objeto agarrado ---
+// Subir de golpe (write directo) puede lanzar/botar el objeto por la
+// aceleración repentina del cabezal. Moverlo en pasos pequeños con una
+// pausa entre cada uno sube el objeto de forma suave.
+const int SERVO_PASO_RAMPA_GRADOS = 5;
+const int SERVO_DELAY_PASO_RAMPA_MS = 25;
+
+// --- Paso de ajuste fino del servo en MODO_OPERACION 2 (grados por '+'/'-') ---
+const int SERVO_PASO_AJUSTE_GRADOS = 2;
 
 // --- Relación de transmisión (Pasos por milímetro) ---
 // PASOS_POR_MM = (pasos_motor_por_vuelta x microstepping) / (dientes_polea x paso_correa_mm)
@@ -151,8 +162,8 @@ const float PASOS_POR_MM = 40.0;     // Polea de 40 dientes (estimada), 1/16 de 
 // Valores confirmados con pruebas físicas de X e Y moviéndose juntos.
 const int DELAY_PASO_X_US        = 1000;  // Movimiento normal eje X
 const int DELAY_PASO_Y_US        = 1000;  // Movimiento normal eje Y
-const int DELAY_HOMING_X_US      = 3500;  // Homing eje X (más lento = toque más suave contra el final de carrera)
-const int DELAY_HOMING_Y_US      = 3500;  // Homing eje Y (más lento = toque más suave contra el final de carrera)
+const int DELAY_HOMING_X_US      = 1750;  // Homing eje X (más lento = toque más suave contra el final de carrera)
+const int DELAY_HOMING_Y_US      = 1750;  // Homing eje Y (más lento = toque más suave contra el final de carrera)
 
 // --- Límites Físicos del Área de Trabajo (en milímetros) ---
 // Medidos por prueba física: tope mecánico de X en 15200 pasos, de Y en
@@ -161,19 +172,21 @@ const float LIMITE_MM_X = 380.0;
 const float LIMITE_MM_Y = 180.0;
 
 // --- Zona de operación (escaneo) en X ---
-// El escaneo (ESTADO_ESCANEO) no arranca desde X=0, sino desde aquí. La
-// franja de X entre 0 y este valor queda fuera del área de escaneo y se usa
-// para las zonas de almacenamiento (ver más abajo).
-const float POS_X_INICIO_ESCANEO_MM = 50.0;
+// Ya no hay franja de X reservada para almacenamiento (las cajas se movieron
+// a la franja de Y, ver más abajo), así que el escaneo cubre todo el eje X
+// desde el origen.
+const float POS_X_INICIO_ESCANEO_MM = 0.0;
 
 // --- Posición Física de las Cajas de Clasificación (en milímetros) ---
-// Ancladas en la franja de X reservada (fuera de la zona de escaneo, ver
-// POS_X_INICIO_ESCANEO_MM), diferenciadas por Y en 3 zonas iguales dentro
-// de LIMITE_MM_Y (180mm / 3 = 60mm por zona, tomando el punto medio de cada
-// una). Ajustar POS_X_*_MM si el almacenamiento no queda a esa X exacta.
-const float POS_X_ROJO_MM  = 25.0;   const float POS_Y_ROJO_MM  = 30.0;   // Zona 1: 0-60mm
-const float POS_X_VERDE_MM = 25.0;   const float POS_Y_VERDE_MM = 90.0;   // Zona 2: 60-120mm
-const float POS_X_AZUL_MM  = 25.0;   const float POS_Y_AZUL_MM  = 150.0;  // Zona 3: 120-180mm
+// Ancladas en la franja de Y reservada [150, 180]mm (el final del eje Y,
+// fuera del rango que el escaneo interpreta como "objeto", ver
+// VL53_RANGO_MAX_MM más abajo), diferenciadas por X en 3 zonas iguales
+// dentro de LIMITE_MM_X (380mm / 3 ≈ 126.7mm por zona, tomando el punto
+// medio de cada una). Ajustar POS_Y_*_MM si el almacenamiento no queda a esa
+// Y exacta dentro de la franja.
+const float POS_X_ROJO_MM  = 63.3;   const float POS_Y_ROJO_MM  = 165.0;  // Zona 1: 0-126.7mm
+const float POS_X_VERDE_MM = 190.0;  const float POS_Y_VERDE_MM = 165.0;  // Zona 2: 126.7-253.3mm
+const float POS_X_AZUL_MM  = 316.7;  const float POS_Y_AZUL_MM  = 165.0;  // Zona 3: 253.3-380mm
 
 // --- CONVERSIÓN AUTOMÁTICA A PASOS (Calculado en tiempo de compilación) ---
 const long LIMITE_PASOS_X = (long)(LIMITE_MM_X * PASOS_POR_MM);
@@ -197,29 +210,51 @@ const long POS_Y_LECTURA_COLOR = (long)(POS_Y_LECTURA_COLOR_MM * PASOS_POR_MM);
 // --- Rango útil del VL53L0X para considerar que hay un objeto en frente ---
 // Si la distancia medida es mayor a este valor (o la lectura es inválida),
 // se asume que no hay objeto presente en esa posición X del escaneo.
+// Limitado a 150mm (no a LIMITE_MM_Y=180mm) a propósito: las cajas de
+// almacenamiento ahora están físicamente ancladas en la franja de Y
+// [150,180]mm (ver POS_Y_*_MM), y quedan dentro del corredor que recorre el
+// cabezal. Si el escaneo llegara a interpretar esa franja como zona de
+// objetos, confundiría las cajas mismas con un objeto a recoger.
 const float VL53_RANGO_MAX_MM = 150.0;
 
 // --- Offset de calibración del VL53L0X (en mm) ---
-// El código asume que "distancia medida por el sensor" == "posición Y real
-// del objeto desde el home de Y". Eso solo es cierto si el lente del sensor
-// queda exactamente en el mismo punto físico que el home de Y (Y=0). Si el
-// lente está desplazado unos mm/cm respecto a ese punto, cada posición Y
-// calculada tendrá el mismo error sistemático (el cabezal siempre se pasa,
-// o siempre se queda corto, por la misma cantidad).
+// Offset TOTAL, calibrado empíricamente moviendo el cabezal al valor
+// calculado y comparando contra dónde está realmente el objeto (no una
+// separación física medida con regla): incluye tanto cualquier sesgo propio
+// del sensor como la separación entre el lente y el punto de agarre. El
+// motor Y mueve el agarre, no el sensor, así que su objetivo real es la
+// distancia cruda MENOS este offset.
 //
-// CÓMO CALIBRAR:
-//   1. Sube el firmware en MODO_OPERACION=1 (imprime distancia cruda cada 2s).
-//   2. Coloca un objeto a una distancia real conocida del sensor (mídela con
-//      una regla/cinta métrica desde el lente del sensor), por ejemplo 100mm.
-//   3. Anota lo que imprime el sensor por Serial para esa distancia real.
-//   4. VL53_OFFSET_MM = (distancia_real_mm) - (distancia_leida_por_sensor_mm).
-//      Si el sensor lee DE MÁS (ej. lee 130 cuando la distancia real es
-//      100mm), el offset debe ser NEGATIVO (-30) para corregirlo.
-//   5. Repite en 2-3 distancias distintas dentro del rango útil para
-//      confirmar que el offset es constante (si varía mucho con la
-//      distancia, el problema no es un offset fijo sino de escala/óptica:
-//      avisa antes de seguir calibrando).
-const float VL53_OFFSET_MM = 0.0;
+// CÓMO RECALIBRAR:
+//   1. Sube el firmware, coloca un objeto y deja que el sistema lo detecte
+//      y se mueva a la posición calculada (ESTADO_GOTO_OBJETO).
+//   2. Mide con regla/cinta métrica dónde está REALMENTE el objeto respecto
+//      al home de Y, y compara contra el "Y estimado" que imprime
+//      [DETECCION] (que ya incluye el offset actual).
+//   3. Si el cabezal se pasó de largo por Nmm, hay que restar N mm más al
+//      offset (más negativo). Si se quedó corto por Nmm, sumar N mm.
+//   4. Repite hasta que el "Y estimado" impreso coincida con la posición
+//      real medida del objeto.
+//
+// Calibrado: con lectura cruda de 145mm, el offset de -30 dejaba el target
+// en 115mm, pero el objeto real estaba en 85mm (30mm antes) -> offset total
+// correcto: -60mm (145 - 60 = 85).
+const float VL53_OFFSET_MM = -75.0;
+
+// --- Radio de la tapa/objeto a recoger (en mm) ---
+// Las tapas son circulares: el escaneo encuentra el centro real en X y el
+// borde más cercano en Y buscando el punto de distancia MÍNIMA mientras el
+// carro recorre el objeto (ver ESTADO_ESCANEO), y a esa distancia mínima se
+// le suma este radio para llegar al centro real en Y.
+const float RADIO_TAPA_MM = 15.0;
+
+// --- Tolerancia a lecturas fallidas seguidas durante el escaneo de un objeto ---
+// Mientras se recorre el objeto para hallar su punto de distancia mínima, no
+// toda lectura sale válida (ej. tapas azules/verdes reflejan peor el IR y dan
+// más RangeStatus distinto de 0, ver leerSensorDistancia). Se toleran hasta
+// esta cantidad de lecturas fallidas SEGUIDAS antes de asumir que ya se pasó
+// el objeto por completo.
+const int TOLERANCIA_PERDIDAS_ESCANEO = 4;
 
 // --- Pasos de X entre cada lectura del VL53L0X durante el escaneo ---
 // El VL53L0X tarda ~30-50ms por medición; leerlo en cada paso individual
@@ -258,6 +293,7 @@ enum EstadoSistema {
   ESTADO_DEPOSITAR,
   ESTADO_RETORNO,
 #if MODO_OPERACION == 0
+
   // Estado de pausa: solo se entra aquí si llega un comando MQTT "STOP".
   // El ciclo automático original (HOMING->ESCANEO->...->RETORNO->ESCANEO)
   // nunca lo visita por sí solo, así que sin WiFi/MQTT el comportamiento
@@ -312,6 +348,24 @@ int contadorRojo = 0;
 int contadorVerde = 0;
 int contadorAzul = 0;
 uint16_t ultimaDistanciaMmMQTT = 0;
+
+// --- Ajuste fino de Y, calibrable en caliente por MQTT (sin recompilar) ---
+// Se suma (en mm) a la posición de agarre calculada por el escaneo (que ya
+// incluye VL53_OFFSET_MM y RADIO_TAPA_MM), justo antes de mover el cabezal
+// en ESTADO_GOTO_OBJETO. Empieza en 0 (sin corrección extra); la app web lo
+// ajusta con el comando "SET_Y_OFFSET" para afinar el agarre sin flashear.
+float ajusteFinoYMm = 0.0;
+
+// --- Caja destino manual (override del color detectado) ---
+// DESCONOCIDO = automático (usa colorDetectado, el color leído por el
+// TCS3200, como siempre). Si la app web fija ROJO/VERDE/AZUL con el comando
+// "SET_DESTINO", ESTADO_DEPOSITAR ignora el color detectado y lleva el
+// objeto a la caja elegida manualmente, hasta que se vuelva a poner "AUTO".
+TipoColor colorDestinoManual = DESCONOCIDO;
+
+// Declarada aquí (definida más abajo) para poder llamarla desde
+// moverACoordenadas()/homingXY(), que aparecen antes en el archivo.
+void publicarTelemetria();
 #endif
 
 // ==========================================
@@ -372,6 +426,17 @@ void moverACoordenadas(long xDestino, long yDestino) {
 
   Serial.printf("[MOVE] Moviendo a X:%ld, Y:%ld (Actual X:%ld, Y:%ld)\n", xDestino, yDestino, posicionActualX, posicionActualY);
 
+#if MODO_OPERACION == 0
+  // Igual que en homingXY(): un solo movimiento puede recorrer hasta 380mm
+  // (varios segundos bloqueado), así que hay que seguir atendiendo MQTT o
+  // el broker corta la conexión por keepalive y la app web se ve "offline".
+  // También se publica telemetría periódicamente (no solo mqttClient.loop())
+  // para que la posición en la app web se vea moverse en vivo, en vez de
+  // quedar congelada hasta que termine el movimiento.
+  unsigned long ultimoServicioMQTT = 0;
+  unsigned long ultimaTelemetriaMovimiento = 0;
+#endif
+
   // --- EJE X ---
   int dirX = (xDestino >= posicionActualX) ? DIR_X_ADELANTE : DIR_X_ATRAS;
   long pasosX = abs(xDestino - posicionActualX);
@@ -383,6 +448,16 @@ void moverACoordenadas(long xDestino, long yDestino) {
     }
     darPaso(PIN_X_STEP, PIN_X_DIR, dirX, DELAY_PASO_X_US);
     posicionActualX += (dirX == DIR_X_ADELANTE) ? 1 : -1;
+#if MODO_OPERACION == 0
+    if (millis() - ultimoServicioMQTT > 50) {
+      ultimoServicioMQTT = millis();
+      if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
+    }
+    if (millis() - ultimaTelemetriaMovimiento > INTERVALO_TELEMETRIA_MS) {
+      ultimaTelemetriaMovimiento = millis();
+      publicarTelemetria();
+    }
+#endif
   }
 
   // --- EJE Y ---
@@ -396,6 +471,16 @@ void moverACoordenadas(long xDestino, long yDestino) {
     }
     darPaso(PIN_Y_STEP, PIN_Y_DIR, dirY, DELAY_PASO_Y_US);
     posicionActualY += (dirY == DIR_Y_ADELANTE) ? 1 : -1;
+#if MODO_OPERACION == 0
+    if (millis() - ultimoServicioMQTT > 50) {
+      ultimoServicioMQTT = millis();
+      if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
+    }
+    if (millis() - ultimaTelemetriaMovimiento > INTERVALO_TELEMETRIA_MS) {
+      ultimaTelemetriaMovimiento = millis();
+      publicarTelemetria();
+    }
+#endif
   }
 
   Serial.printf("[POSICION] Desde home -> X:%ld pasos (%.1f mm) | Y:%ld pasos (%.1f mm)\n",
@@ -409,15 +494,47 @@ void moverACoordenadas(long xDestino, long yDestino) {
  * los pines de los motores ya configurados como OUTPUT.
  */
 void homingXY() {
+#if MODO_OPERACION == 0
+  // homingXY() puede tardar varios segundos en recorrer todo el eje (peor
+  // caso: desde el extremo opuesto al home). Como es bloqueante, sin esto
+  // mqttClient.loop() nunca se llama mientras dura, el broker no recibe
+  // PING y termina cortando la conexión por keepalive -> la app web ve el
+  // ESP32 "offline" aunque en realidad esté funcionando bien. También se
+  // publica telemetría periódicamente para que el estado "HOMING" se vea
+  // reflejado en la app en vivo, no solo al terminar.
+  unsigned long ultimoServicioMQTT = 0;
+  unsigned long ultimaTelemetriaMovimiento = 0;
+#endif
+
   Serial.println("[HOMING] Eje Y...");
   while (!finalDeCarreraPresionado(PIN_LIMIT_Y)) {
     darPaso(PIN_Y_STEP, PIN_Y_DIR, DIR_Y_ATRAS, DELAY_HOMING_Y_US);
+#if MODO_OPERACION == 0
+    if (millis() - ultimoServicioMQTT > 50) {
+      ultimoServicioMQTT = millis();
+      if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
+    }
+    if (millis() - ultimaTelemetriaMovimiento > INTERVALO_TELEMETRIA_MS) {
+      ultimaTelemetriaMovimiento = millis();
+      publicarTelemetria();
+    }
+#endif
   }
   posicionActualY = 0; // Origen Y calibrado
 
   Serial.println("[HOMING] Eje X...");
   while (!finalDeCarreraPresionado(PIN_LIMIT_X)) {
     darPaso(PIN_X_STEP, PIN_X_DIR, DIR_X_ATRAS, DELAY_HOMING_X_US);
+#if MODO_OPERACION == 0
+    if (millis() - ultimoServicioMQTT > 50) {
+      ultimoServicioMQTT = millis();
+      if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
+    }
+    if (millis() - ultimaTelemetriaMovimiento > INTERVALO_TELEMETRIA_MS) {
+      ultimaTelemetriaMovimiento = millis();
+      publicarTelemetria();
+    }
+#endif
   }
   posicionActualX = 0; // Origen X calibrado
 
@@ -451,17 +568,12 @@ void imprimirZonas() {
                 POS_Y_LECTURA_COLOR, POS_Y_LECTURA_COLOR_MM);
 }
 
-// --- Rampa del servo (arranque suave) ---
-// Un servo bajo carga consume su pico de corriente más alto justo al
-// arrancar el movimiento (corriente de arranque/stall), no mientras ya está
-// en marcha. Saltar de golpe de SERVO_ANGULO_ABAJO a SERVO_ANGULO_ARRIBA con
-// el objeto ya pegado exige ese pico de golpe; moverlo en pasos pequeños
-// reparte la demanda de corriente en el tiempo y baja el pico instantáneo,
-// lo que puede ser la diferencia entre "alcanza" y "se queda abajo" cuando
-// la alimentación es justa.
-const int SERVO_PASO_RAMPA_GRADOS = 5;
-const int SERVO_DELAY_PASO_RAMPA_MS = 25;
-
+/**
+ * @brief Mueve el servo en pasos pequeños (SERVO_PASO_RAMPA_GRADOS) con una
+ * pausa entre cada uno, en vez de saltar de golpe al ángulo destino. Se usa
+ * al levantar con el objeto ya agarrado: el frenazo/arranque brusco de un
+ * write() directo puede lanzarlo fuera del electroimán.
+ */
 void moverServoGradual(int anguloDestino) {
   int anguloActual = miServo.read(); // último ángulo escrito (sin sensor de posición real)
   int paso = (anguloDestino >= anguloActual) ? SERVO_PASO_RAMPA_GRADOS : -SERVO_PASO_RAMPA_GRADOS;
@@ -492,7 +604,12 @@ bool leerSensorDistancia(long &pasosYCalculados) {
   VL53L0X_RangingMeasurementData_t medida;
   sensorDistancia.rangingTest(&medida, false);
 
-  if (medida.RangeStatus == 4) return false; // 4 = fuera de rango / lectura inválida
+  // RangeStatus: 0=Range Valid, 1=Sigma Fail, 2=Signal Fail, 3=Min Range
+  // Fail, 4=Phase Fail, 5=Hardware Fail. Solo 0 es una medida confiable: los
+  // demás (sobre todo 1/2, señal débil o ruidosa) son justo lo que se ve
+  // cuando NO hay nada al frente, y aceptarlos como válidos es lo que
+  // causaba lecturas "fantasma" cambiantes sin objeto presente.
+  if (medida.RangeStatus != 0) return false;
 
   float distanciaMm = medida.RangeMilliMeter;
   Serial.printf("[VL53 RAW] %.0f mm (RangeStatus:%d)\n", distanciaMm, medida.RangeStatus);
@@ -500,10 +617,15 @@ bool leerSensorDistancia(long &pasosYCalculados) {
   ultimaDistanciaMmMQTT = (uint16_t)distanciaMm;
 #endif
 
-  float distanciaCorregidaMm = distanciaMm + VL53_OFFSET_MM;
-  if (distanciaCorregidaMm > VL53_RANGO_MAX_MM || distanciaCorregidaMm > LIMITE_MM_Y) return false; // fuera del area util o de la zona de operacion
+  // Traduce la distancia medida (desde el lente, ya real, sin sesgo propio)
+  // a la posición que debe alcanzar el AGARRE, restando la separación física
+  // fija entre el lente y el agarre (ver VL53_OFFSET_MM).
+  float distanciaObjetivoGarraMm = distanciaMm + VL53_OFFSET_MM;
+  Serial.printf("[VL53 OBJETIVO GARRA] %.0f mm (offset:%.1f mm)\n", distanciaObjetivoGarraMm, VL53_OFFSET_MM);
 
-  long pasosCalculados = (long)(distanciaCorregidaMm * PASOS_POR_MM);
+  if (distanciaObjetivoGarraMm > VL53_RANGO_MAX_MM || distanciaObjetivoGarraMm > LIMITE_MM_Y) return false; // fuera del area util o de la zona de operacion
+
+  long pasosCalculados = (long)(distanciaObjetivoGarraMm * PASOS_POR_MM);
   pasosYCalculados = constrain(pasosCalculados, 0, LIMITE_PASOS_Y);
   return true;
 }
@@ -628,7 +750,9 @@ void publicarTelemetria() {
   doc["magnet"] = electroimanEstadoMQTT;
   doc["servo"] = servoAbajoMQTT ? "ABAJO" : "ARRIBA";
   doc["dist_mm"] = ultimaDistanciaMmMQTT;
+  doc["y_fine_offset_mm"] = ajusteFinoYMm;
   doc["color"] = getColorNombre(colorDetectado);
+  doc["destino_manual"] = (colorDestinoManual == DESCONOCIDO) ? "AUTO" : getColorNombre(colorDestinoManual);
   doc["counts"]["red"] = contadorRojo;
   doc["counts"]["green"] = contadorVerde;
   doc["counts"]["blue"] = contadorAzul;
@@ -688,6 +812,31 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
                        posicionActualY + (long)(dy * PASOS_POR_MM));
   } else if (strcmp(cmd, "RESET_DRIVERS") == 0) {
     resetControladoresMotor();
+  } else if (strcmp(cmd, "SET_Y_OFFSET") == 0 && doc["value"].is<float>()) {
+    ajusteFinoYMm = doc["value"];
+    Serial.printf("[CALIBRACION] Ajuste fino de Y (MQTT): %.1f mm\n", ajusteFinoYMm);
+  } else if (strcmp(cmd, "RETRY_GRAB") == 0) {
+    // Reintenta el agarre en la ÚLTIMA posición detectada (objetoDetectadoX/Y
+    // no cambian hasta el próximo escaneo), aplicando el ajuste fino de Y
+    // actual. Pensado para calibrar en vivo: ajustar SET_Y_OFFSET y volver a
+    // intentar sin tener que re-escanear desde cero.
+    Serial.println("[MQTT] Reintentando agarre en la última posición detectada...");
+    estadoActual = ESTADO_GOTO_OBJETO;
+  } else if (strcmp(cmd, "SET_DESTINO") == 0) {
+    const char* colorStr = doc["color"];
+    if (!colorStr || strcmp(colorStr, "AUTO") == 0) {
+      colorDestinoManual = DESCONOCIDO;
+      Serial.println("[CALIBRACION] Caja destino: AUTO (color detectado por sensor)");
+    } else if (strcmp(colorStr, "ROJO") == 0) {
+      colorDestinoManual = ROJO;
+      Serial.println("[CALIBRACION] Caja destino forzada (MQTT): ROJO");
+    } else if (strcmp(colorStr, "VERDE") == 0) {
+      colorDestinoManual = VERDE;
+      Serial.println("[CALIBRACION] Caja destino forzada (MQTT): VERDE");
+    } else if (strcmp(colorStr, "AZUL") == 0) {
+      colorDestinoManual = AZUL;
+      Serial.println("[CALIBRACION] Caja destino forzada (MQTT): AZUL");
+    }
   }
 
   publicarTelemetria();
@@ -784,10 +933,30 @@ void setup() {
 #endif
 
 #if MODO_OPERACION == 2
-  Serial.println("=== MODO PRUEBA: SERVOMOTOR MG90S ===");
+  Serial.println("=== MODO PRUEBA: SERVOMOTOR MG90S (AJUSTE INTERACTIVO) + LECTURA DE COLOR ===");
+  Serial.printf("Comandos: '+' sube %d grados, '-' baja %d grados, un numero (0-180) va directo a ese angulo, 'A' = ARRIBA (%d), 'B' = ABAJO (%d), '1' enciende el electroiman, '0' lo apaga.\n",
+                SERVO_PASO_AJUSTE_GRADOS, SERVO_PASO_AJUSTE_GRADOS, SERVO_ANGULO_ARRIBA, SERVO_ANGULO_ABAJO);
+  Serial.println("El color leido por el TCS3200 se imprime solo cada cierto tiempo, para calibrar a que altura del servo lee bien.");
   miServo.attach(PIN_SERVO);
   miServo.write(SERVO_ANGULO_ARRIBA); // Empezar con el cabezal arriba
-  return; // No se inicializa nada más: este modo solo prueba el servo.
+  Serial.printf("[SERVO] -> %d grados\n", SERVO_ANGULO_ARRIBA);
+
+  // --- Configuración del Sensor de Color (para calibrar altura junto al servo) ---
+  pinMode(TCS_S0, OUTPUT);
+  pinMode(TCS_S1, OUTPUT);
+  pinMode(TCS_S2, OUTPUT);
+  pinMode(TCS_S3, OUTPUT);
+  pinMode(TCS_OUT, INPUT);
+  // Escalar la frecuencia de salida del TCS3200 al 20% (Estándar recomendado)
+  digitalWrite(TCS_S0, HIGH);
+  digitalWrite(TCS_S1, LOW);
+
+  // --- Electroimán activado para la prueba (simula tener el objeto agarrado) ---
+  pinMode(PIN_MOSFET_MAG, OUTPUT);
+  digitalWrite(PIN_MOSFET_MAG, HIGH);
+  Serial.println("[ELECTROIMAN] ENCENDIDO (para probar con el objeto agarrado).");
+
+  return; // No se inicializa nada más: este modo solo prueba servo + color + electroimán.
 #endif
 
 #if MODO_OPERACION == 1
@@ -962,16 +1131,69 @@ void loop() {
 
 #elif MODO_OPERACION == 2
 // ==========================================
-// PRUEBA DEL SERVOMOTOR MG90S
+// AJUSTE INTERACTIVO DEL SERVOMOTOR MG90S POR SERIAL (+ LECTURA DE COLOR)
 // ==========================================
-void loop() {
-  Serial.printf("[SERVO] -> ARRIBA (%d grados)\n", SERVO_ANGULO_ARRIBA);
-  miServo.write(SERVO_ANGULO_ARRIBA);
-  delay(1000);
+int anguloServoActual = SERVO_ANGULO_ARRIBA;
+unsigned long ultimaLecturaColorMs = 0;
+const unsigned long INTERVALO_LECTURA_COLOR_MS = 500;
 
-  Serial.printf("[SERVO] -> ABAJO (%d grados)\n", SERVO_ANGULO_ABAJO);
-  miServo.write(SERVO_ANGULO_ABAJO);
-  delay(1000);
+void loop() {
+  if (Serial.available() > 0) {
+    String linea = Serial.readStringUntil('\n');
+    linea.trim();
+    if (linea.length() > 0) {
+      if (linea == "1") {
+        digitalWrite(PIN_MOSFET_MAG, HIGH);
+        Serial.println("[ELECTROIMAN] ENCENDIDO");
+      } else if (linea == "0") {
+        digitalWrite(PIN_MOSFET_MAG, LOW);
+        Serial.println("[ELECTROIMAN] APAGADO");
+      } else if (linea == "+") {
+        anguloServoActual += SERVO_PASO_AJUSTE_GRADOS;
+        anguloServoActual = constrain(anguloServoActual, 0, 180);
+        miServo.write(anguloServoActual);
+        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+      } else if (linea == "-") {
+        anguloServoActual -= SERVO_PASO_AJUSTE_GRADOS;
+        anguloServoActual = constrain(anguloServoActual, 0, 180);
+        miServo.write(anguloServoActual);
+        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+      } else if (linea.equalsIgnoreCase("A")) {
+        anguloServoActual = SERVO_ANGULO_ARRIBA;
+        miServo.write(anguloServoActual);
+        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+      } else if (linea.equalsIgnoreCase("B")) {
+        anguloServoActual = SERVO_ANGULO_ABAJO;
+        miServo.write(anguloServoActual);
+        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+      } else {
+        bool esNumero = linea.length() > 0;
+        for (unsigned int i = 0; i < linea.length() && esNumero; i++) {
+          char c = linea.charAt(i);
+          if (!isDigit(c) && !(i == 0 && c == '-')) esNumero = false;
+        }
+        if (!esNumero) {
+          Serial.println("[ERROR] Comando invalido. Usa '+', '-', un angulo (0-180), 'A' (arriba), 'B' (abajo), '1'/'0' (electroiman).");
+        } else {
+          anguloServoActual = constrain(linea.toInt(), 0, 180);
+          miServo.write(anguloServoActual);
+          Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+        }
+      }
+    }
+  }
+
+  // Lectura de color periódica (no bloqueada por los comandos del servo),
+  // para ver en vivo cómo cambia el color leído según la altura del servo.
+  if (millis() - ultimaLecturaColorMs >= INTERVALO_LECTURA_COLOR_MS) {
+    ultimaLecturaColorMs = millis();
+    TipoColor color = obtenerColorTCS3200();
+    const char *nombreColor = (color == ROJO) ? "ROJO"
+                            : (color == VERDE) ? "VERDE"
+                            : (color == AZUL) ? "AZUL"
+                            : "SIN LECTURA";
+    Serial.printf("[SERVO %d grados] Color: %s\n", anguloServoActual, nombreColor);
+  }
 }
 
 #elif MODO_OPERACION == 1
@@ -988,10 +1210,16 @@ void loop() {
   if (vl53Disponible) {
     VL53L0X_RangingMeasurementData_t medida;
     sensorDistancia.rangingTest(&medida, false);
-    if (medida.RangeStatus != 4) {
-      Serial.printf("[PRUEBA] Color: %s | Distancia: %u mm\n", nombreColor, medida.RangeMilliMeter);
+    // RangeStatus: 0=Valid, 1=Sigma Fail, 2=Signal Fail, 3=Min Range Fail,
+    // 4=Phase Fail, 5=Hardware Fail. Se imprime siempre el status crudo para
+    // ver en qué estado cae el sensor cuando no hay nada al frente (suele
+    // ser 1 o 2, no solo 4).
+    if (medida.RangeStatus == 0) {
+      Serial.printf("[PRUEBA] Color: %s | Distancia: %u mm (status:%d VALIDA)\n",
+                    nombreColor, medida.RangeMilliMeter, medida.RangeStatus);
     } else {
-      Serial.printf("[PRUEBA] Color: %s | Distancia: fuera de rango\n", nombreColor);
+      Serial.printf("[PRUEBA] Color: %s | Distancia: %u mm (status:%d NO CONFIABLE, descartar)\n",
+                    nombreColor, medida.RangeMilliMeter, medida.RangeStatus);
     }
   } else {
     Serial.printf("[PRUEBA] Color: %s | Distancia: sensor VL53L0X no disponible\n", nombreColor);
@@ -1055,31 +1283,63 @@ void loop() {
         moverACoordenadas(POS_X_INICIO_ESCANEO, posicionActualY);
       }
 
-      while (posicionActualX < LIMITE_PASOS_X && estadoActual == ESTADO_ESCANEO) {
-        // Dar varios pasos seguidos en X antes de volver a leer el sensor:
-        // el VL53L0X tarda ~30-50ms por medición, así que leerlo en CADA
-        // paso individual frena el escaneo a paso de tortuga. Se agrupan
-        // PASOS_ENTRE_LECTURAS_ESCANEO pasos (rápido) entre cada lectura.
-        for (int i = 0; i < PASOS_ENTRE_LECTURAS_ESCANEO && posicionActualX < LIMITE_PASOS_X; i++) {
-          darPaso(PIN_X_STEP, PIN_X_DIR, DIR_X_ADELANTE, 1500);
-          posicionActualX++;
+      // La tapa es redonda: mientras el carro X la recorre, la distancia Y
+      // medida traza un mínimo justo en el X que pasa por su centro (el
+      // punto de un círculo más cercano al sensor está en su diámetro). En
+      // vez de parar en el primer borde detectado (+ un offset fijo
+      // aproximado), se sigue escaneando hasta perder el objeto, y se usa el
+      // X/Y de la lectura de MENOR distancia como centro real: más preciso
+      // que cualquier offset fijo, y necesario para que el electroimán
+      // quede centrado.
+      {
+        bool objetoEnVista = false;
+        long xEnMinimo = 0;
+        long yMinimoPasos = 0;
+        int lecturasFallidasSeguidas = 0;
+
+        while (posicionActualX < LIMITE_PASOS_X && estadoActual == ESTADO_ESCANEO) {
+          // Dar varios pasos seguidos en X antes de volver a leer el sensor:
+          // el VL53L0X tarda ~30-50ms por medición, así que leerlo en CADA
+          // paso individual frena el escaneo a paso de tortuga. Se agrupan
+          // PASOS_ENTRE_LECTURAS_ESCANEO pasos (rápido) entre cada lectura.
+          for (int i = 0; i < PASOS_ENTRE_LECTURAS_ESCANEO && posicionActualX < LIMITE_PASOS_X; i++) {
+            darPaso(PIN_X_STEP, PIN_X_DIR, DIR_X_ADELANTE, 1500);
+            posicionActualX++;
+          }
+
+          // Deja que MQTT procese un posible "STOP" sin frenar el escaneo
+          // (el escaneo completo puede tardar varios segundos en un solo
+          // paso por loop(), y sin esto el broker no vería señales de vida).
+          if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
+
+          long yCalculado = 0;
+          bool huboDeteccion = leerSensorDistancia(yCalculado);
+
+          if (huboDeteccion) {
+            lecturasFallidasSeguidas = 0;
+            if (!objetoEnVista || yCalculado < yMinimoPasos) {
+              yMinimoPasos = yCalculado;
+              xEnMinimo = posicionActualX;
+            }
+            objetoEnVista = true;
+          } else if (objetoEnVista) {
+            // Ya veníamos viendo el objeto: cuenta lecturas fallidas
+            // seguidas (tolerantes a ruido, ej. tapas azules/verdes que
+            // reflejan peor el IR) antes de asumir que ya lo pasamos.
+            lecturasFallidasSeguidas++;
+            if (lecturasFallidasSeguidas >= TOLERANCIA_PERDIDAS_ESCANEO) break;
+          }
         }
 
-        // Deja que MQTT procese un posible "STOP" sin frenar el escaneo
-        // (el escaneo completo puede tardar varios segundos en un solo
-        // paso por loop(), y sin esto el broker no vería señales de vida).
-        if (WiFi.status() == WL_CONNECTED) mqttClient.loop();
-
-        // Leer sensor de distancia VL53L0X para estimar posición Y
-        long yCalculado = 0;
-        if (leerSensorDistancia(yCalculado)) {
-          objetoDetectadoX = posicionActualX;
-          objetoDetectadoY = yCalculado;
-          Serial.printf("[DETECCION] Objeto detectado en X: %ld pasos, Y estimado: %ld pasos!\n",
-                        objetoDetectadoX, objetoDetectadoY);
-
+        if (objetoEnVista) {
+          long pasosRadioTapa = (long)(RADIO_TAPA_MM * PASOS_POR_MM);
+          objetoDetectadoX = xEnMinimo;
+          objetoDetectadoY = constrain(yMinimoPasos + pasosRadioTapa, 0, LIMITE_PASOS_Y);
+          Serial.printf("[DETECCION] Centro real (distancia minima) en X: %ld pasos (%.1f mm) | Y minimo: %.1f mm + radio %.1f mm -> objetivo agarre Y: %ld pasos (%.1f mm)!\n",
+                        xEnMinimo, xEnMinimo / PASOS_POR_MM,
+                        yMinimoPasos / PASOS_POR_MM, RADIO_TAPA_MM,
+                        objetoDetectadoY, objetoDetectadoY / PASOS_POR_MM);
           estadoActual = ESTADO_GOTO_OBJETO;
-          break;
         }
       }
 
@@ -1093,13 +1353,20 @@ void loop() {
     // -------------------------------------------------------------
     // ESTADO 3: GOTO OBJETO (Moverse a la posición del objeto)
     // -------------------------------------------------------------
-    case ESTADO_GOTO_OBJETO:
+    case ESTADO_GOTO_OBJETO: {
       Serial.println("[MAQUINA] Estado: IR A LA POSICION DEL OBJETO...");
-      // Nos movemos al punto exacto donde se detectó el objeto
-      moverACoordenadas(objetoDetectadoX, objetoDetectadoY);
+      // Nos movemos al punto detectado + el ajuste fino de Y (calibrable
+      // por MQTT sin recompilar, ver ajusteFinoYMm).
+      long yObjetivoConAjuste = constrain(
+          objetoDetectadoY + (long)(ajusteFinoYMm * PASOS_POR_MM), 0, LIMITE_PASOS_Y);
+      Serial.printf("[GOTO] Y detectado: %ld pasos (%.1f mm) + ajuste fino: %.1f mm -> objetivo: %ld pasos (%.1f mm)\n",
+                    objetoDetectadoY, objetoDetectadoY / PASOS_POR_MM, ajusteFinoYMm,
+                    yObjetivoConAjuste, yObjetivoConAjuste / PASOS_POR_MM);
+      moverACoordenadas(objetoDetectadoX, yObjetivoConAjuste);
       delay(500);
       estadoActual = ESTADO_AGARRE;
       break;
+    }
 
     // -------------------------------------------------------------
     // ESTADO 4: AGARRE (Bajar servo, activar imán y levantar)
@@ -1128,8 +1395,8 @@ void loop() {
       // que se duermen los drivers (sin soltar la posición de los ejes,
       // solo cortan su corriente de sostenimiento) mientras dura el
       // levantamiento, y se reactivan antes de volver a mover algún eje.
-      // Además se sube en rampa (no de golpe) para repartir el pico de
-      // corriente de arranque del servo en vez de pedirlo todo de una vez.
+      // Además se sube en rampa (no de golpe) para no lanzar el objeto por
+      // el arranque brusco del servo.
       digitalWrite(PIN_MOTOR_RESET, LOW);
       moverServoGradual(SERVO_ANGULO_ARRIBA);
       servoAbajoMQTT = false;
@@ -1150,6 +1417,12 @@ void loop() {
     // -------------------------------------------------------------
     case ESTADO_LORE_COLOR:
       Serial.println("[MAQUINA] Estado: LECTURA DE COLOR...");
+
+      // El objeto sigue agarrado (electroimán encendido): se baja en rampa
+      // a la altura calibrada para el TCS3200, no de golpe, para no botarlo.
+      moverServoGradual(SERVO_ANGULO_LECTURA_COLOR);
+      delay(300); // Asienta antes de leer
+
       colorDetectado = obtenerColorTCS3200();
       publicarTelemetria();
 
@@ -1174,8 +1447,18 @@ void loop() {
     // -------------------------------------------------------------
     // ESTADO 6: DEPOSITAR (Moverse a la caja y soltar)
     // -------------------------------------------------------------
-    case ESTADO_DEPOSITAR:
+    case ESTADO_DEPOSITAR: {
       Serial.println("[MAQUINA] Estado: CLASIFICAR Y DEPOSITAR...");
+
+      // Si hay una caja destino forzada desde la web (colorDestinoManual !=
+      // DESCONOCIDO), se usa esa en vez del color leído por el TCS3200. Se
+      // sobreescribe colorDetectado para que la telemetría/UI reflejen a
+      // dónde va realmente el objeto.
+      if (colorDestinoManual != DESCONOCIDO) {
+        Serial.printf("[CALIBRACION] Caja destino forzada activa: se ignora color detectado (%s), va a %s\n",
+                      getColorNombre(colorDetectado), getColorNombre(colorDestinoManual));
+        colorDetectado = colorDestinoManual;
+      }
 
       // Seleccionar coordenadas de caja de destino según color
       long destinoX, destinoY;
@@ -1197,10 +1480,12 @@ void loop() {
       moverACoordenadas(destinoX, destinoY);
       delay(500);
 
-      // Opcional: Bajar un poco el servo para no tirar el objeto desde muy alto
-      miServo.write(SERVO_ANGULO_ABAJO);
+      // Baja el servo para depositar. El objeto sigue agarrado (electroimán
+      // aún encendido) y viene de SERVO_ANGULO_LECTURA_COLOR (120°), un salto
+      // más grande que antes, así que se baja en rampa para no botarlo.
+      moverServoGradual(SERVO_ANGULO_ABAJO);
       servoAbajoMQTT = true;
-      delay(800);
+      delay(500);
 
       // Desactivar el Electroimán para soltar el objeto
       digitalWrite(PIN_MOSFET_MAG, LOW);
@@ -1216,6 +1501,7 @@ void loop() {
       publicarTelemetria();
       estadoActual = ESTADO_RETORNO;
       break;
+    }
 
     // -------------------------------------------------------------
     // ESTADO 7: RETORNO (Prepararse para el siguiente ciclo)

@@ -31,6 +31,7 @@ let systemState = {
   color: 'DESCONOCIDO',
   distanceMm: 0,
   yFineOffsetMm: 0,
+  destinoManual: 'AUTO',
   counts: { red: 0, green: 0, blue: 0 }
 };
 
@@ -140,6 +141,7 @@ function handleTelemetryMessage(data) {
   if (data.color !== undefined) systemState.color = data.color;
   if (data.dist_mm !== undefined) systemState.distanceMm = data.dist_mm;
   if (data.y_fine_offset_mm !== undefined) systemState.yFineOffsetMm = parseFloat(data.y_fine_offset_mm);
+  if (data.destino_manual !== undefined) systemState.destinoManual = data.destino_manual;
   if (data.counts) {
     systemState.counts.red = data.counts.red || 0;
     systemState.counts.green = data.counts.green || 0;
@@ -174,6 +176,12 @@ function updateDashboardUI() {
   // se sincroniza con lo último que confirmó el ESP32)
   const fineOffsetDisplay = document.getElementById('fine-offset-display');
   if (fineOffsetDisplay) fineOffsetDisplay.textContent = systemState.yFineOffsetMm.toFixed(1);
+
+  // Sync destination bin buttons with the ESP32's actual state (in case
+  // another client, or the config panel, changed it)
+  document.querySelectorAll('.destino-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.destino === systemState.destinoManual);
+  });
 
   const distanceCard = document.getElementById('card-distance');
   distanceCard.textContent = `${systemState.distanceMm} mm`;
@@ -485,6 +493,16 @@ function initUIEventListeners() {
 
   document.getElementById('btn-retry-grab').addEventListener('click', () => {
     sendCommand({ cmd: 'RETRY_GRAB' });
+  });
+
+  // Destination Bin Override
+  document.querySelectorAll('.destino-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const destino = btn.dataset.destino;
+      systemState.destinoManual = destino;
+      document.querySelectorAll('.destino-btn').forEach((b) => b.classList.toggle('active', b === btn));
+      sendCommand({ cmd: 'SET_DESTINO', color: destino });
+    });
   });
 
   // Reset Motor Drivers Button

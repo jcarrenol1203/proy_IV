@@ -543,6 +543,27 @@ canvas {
   padding: 0.5rem 0.8rem;
 }
 
+.destino-group {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 0.6rem;
+}
+
+.destino-btn {
+  opacity: 0.55;
+  filter: grayscale(0.4);
+}
+
+.destino-btn.active {
+  opacity: 1;
+  filter: none;
+  box-shadow: 0 0 0 2px #fff inset;
+}
+
+.destino-btn.destino-rojo { background: linear-gradient(135deg, #d50000, #ff1744); border: none; color: #fff; }
+.destino-btn.destino-verde { background: linear-gradient(135deg, #00c853, #00e676); border: none; color: #040914; }
+.destino-btn.destino-azul { background: linear-gradient(135deg, #0091ea, #4facfe); border: none; color: #040914; }
+
 .toggle-status {
   font-size: 0.8rem;
   color: var(--text-muted);
