@@ -268,40 +268,41 @@ function drawMachineCanvas() {
     ctx.fillText(`${y}`, margin - 24, py + 3);
   }
 
-  // Draw Storage Bins Area (X: 0 to 50mm)
-  const binZoneWidth = (50 / MACHINE_MAX_X_MM) * drawWidth;
+  // Draw Storage Bins Area (Y: 150 to 180mm, banda superior en todo el ancho de X)
+  const binBandHeight = ((180 - 150) / MACHINE_MAX_Y_MM) * drawHeight;
+  const binBandTop = margin; // Y=180 (tope del eje) queda en el borde superior del canvas
   ctx.fillStyle = 'rgba(255, 255, 255, 0.03)';
-  ctx.fillRect(margin, margin, binZoneWidth, drawHeight);
+  ctx.fillRect(margin, binBandTop, drawWidth, binBandHeight);
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-  ctx.strokeRect(margin, margin, binZoneWidth, drawHeight);
+  ctx.strokeRect(margin, binBandTop, drawWidth, binBandHeight);
 
-  // Bins: RED (0-60mm Y), GREEN (60-120mm Y), BLUE (120-180mm Y)
-  const binH = drawHeight / 3;
+  // Bins: ROJO (X 0-126.7mm), VERDE (X 126.7-253.3mm), AZUL (X 253.3-380mm)
+  const binW = drawWidth / 3;
 
   // Red Bin
   ctx.fillStyle = 'rgba(255, 23, 68, 0.15)';
-  ctx.fillRect(margin + 4, margin + drawHeight - binH + 4, binZoneWidth - 8, binH - 8);
+  ctx.fillRect(margin + 4, binBandTop + 4, binW - 8, binBandHeight - 8);
   ctx.strokeStyle = '#ff1744';
-  ctx.strokeRect(margin + 4, margin + drawHeight - binH + 4, binZoneWidth - 8, binH - 8);
+  ctx.strokeRect(margin + 4, binBandTop + 4, binW - 8, binBandHeight - 8);
   ctx.fillStyle = '#ff1744';
   ctx.font = 'bold 11px Outfit';
-  ctx.fillText('ROJO', margin + 10, margin + drawHeight - binH / 2);
+  ctx.fillText('ROJO', margin + 10, binBandTop + binBandHeight / 2);
 
   // Green Bin
   ctx.fillStyle = 'rgba(0, 230, 118, 0.15)';
-  ctx.fillRect(margin + 4, margin + drawHeight - binH * 2 + 4, binZoneWidth - 8, binH - 8);
+  ctx.fillRect(margin + binW + 4, binBandTop + 4, binW - 8, binBandHeight - 8);
   ctx.strokeStyle = '#00e676';
-  ctx.strokeRect(margin + 4, margin + drawHeight - binH * 2 + 4, binZoneWidth - 8, binH - 8);
+  ctx.strokeRect(margin + binW + 4, binBandTop + 4, binW - 8, binBandHeight - 8);
   ctx.fillStyle = '#00e676';
-  ctx.fillText('VERDE', margin + 10, margin + drawHeight - binH * 1.5);
+  ctx.fillText('VERDE', margin + binW + 10, binBandTop + binBandHeight / 2);
 
   // Blue Bin
   ctx.fillStyle = 'rgba(79, 172, 254, 0.15)';
-  ctx.fillRect(margin + 4, margin + 4, binZoneWidth - 8, binH - 8);
+  ctx.fillRect(margin + binW * 2 + 4, binBandTop + 4, binW - 8, binBandHeight - 8);
   ctx.strokeStyle = '#4facfe';
-  ctx.strokeRect(margin + 4, margin + 4, binZoneWidth - 8, binH - 8);
+  ctx.strokeRect(margin + binW * 2 + 4, binBandTop + 4, binW - 8, binBandHeight - 8);
   ctx.fillStyle = '#4facfe';
-  ctx.fillText('AZUL', margin + 10, margin + binH / 2);
+  ctx.fillText('AZUL', margin + binW * 2 + 10, binBandTop + binBandHeight / 2);
 
   // Scanning Sweep Beam Effect (if in ESCANEO state)
   if (systemState.state === 'ESCANEO') {
