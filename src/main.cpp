@@ -140,7 +140,7 @@ FLUJO DEL SISTEMA:
 // --- Posiciones de Servomotor ---
 const int SERVO_ANGULO_ARRIBA = 90;   // Cabezal levantado (seguro)
 const int SERVO_ANGULO_ABAJO  = 8;   // Cabezal abajo (agarre)
-const int SERVO_ANGULO_LECTURA_COLOR = 120;  // Altura a la que se tomaron las firmas de color (FIRMA_ROJO/VERDE/AZUL); si se cambia, hay que recalibrar
+const int SERVO_ANGULO_LECTURA_COLOR = 120;  // Altura a la que se tomaron las firmas de color (firmaRojo/firmaVerde/firmaAzul); si se cambia, hay que recalibrar
 
 // --- Rampa del servo (usada en TODOS los movimientos del cabezal) ---
 // Antes solo se subía en rampa y se bajaba con un write() directo. Ese salto
@@ -331,37 +331,98 @@ const int TCS_MUESTRAS_CAPTURA_FIRMA = 20;
 // brillo total. Una tapa roja da r alto y b bajo tanto de cerca como de
 // lejos; lo que cambia con la distancia es la suma, que aquí se cancela.
 //
-// Las firmas se siguen guardando en crudo (es lo que imprime el sensor y lo
-// que se anota al calibrar); normalizarColor() las convierte a cromaticidad
-// en el momento de comparar.
+// PERO la cromaticidad sola no basta, y las firmas de abajo lo demuestran:
+// en las TRES sale R > B > G, y en proporciones casi idénticas
+// (0.42/0.28/0.30 la roja, 0.41/0.29/0.30 la azul). Un objeto rojo y uno
+// azul NO pueden dar el mismo perfil: lo que se está midiendo ahí no es el
+// color del objeto sino la GANANCIA DE CADA CANAL DEL SENSOR. Los fotodiodos
+// rojos del TCS3200 responden bastante más que los verdes, y el LED blanco
+// del módulo tampoco emite parejo en las tres bandas, así que el canal R sale
+// alto SIEMPRE, mire lo que mire. Ese sesgo fijo se come la señal de color,
+// que es mucho más pequeña.
 //
+// Eso es exactamente lo que corrige la CALIBRACIÓN BLANCO/NEGRO (ver
+// calBlanco/calNegro abajo): midiendo una referencia blanca se aprende
+// cuánto da cada canal cuando "debería" dar lo mismo en los tres, y midiendo
+// el negro se aprende el piso de cada uno. Con eso, cada canal se reescala a
+// 0.0-1.0 con su propia regla:
+//
+//     balanceado = (crudo - negro) / (blanco - negro)
+//
+// Tras ese reescalado el blanco da (1,1,1), el negro (0,0,0) y una tapa roja
+// por fin da R alto con G/B bajos. La cromaticidad se calcula ENCIMA del
+// valor balanceado: primero se quita el sesgo de canal (blanco/negro),
+// después el brillo total (cromaticidad). Con las dos correcciones juntas la
+// separación entre colores pasa de ~0.00001 a valores utilizables.
+//
+// El pipeline completo, entonces:
+//   crudo (Hz) -> balance blanco/negro -> cromaticidad -> firma más cercana
+//
+// Las firmas se siguen guardando en CRUDO (es lo que imprime el sensor y lo
+// que se anota al calibrar); cromaticidadDeFirma() les aplica exactamente el
+// mismo pipeline que a la lectura antes de comparar, así que ambos lados
+// quedan siempre en la misma escala.
+struct FirmaColorTCS3200 { uint32_t r, g, b; };
+
+// --- Referencias de blanco y negro (balance de canales) ---
+// {0,0,0} en ambas = SIN CALIBRAR: en ese caso se salta el balance y se
+// clasifica solo por cromaticidad cruda (lo que hay hoy, y que no alcanza).
+// Se llenan con los comandos 'CB' (blanco) y 'CN' (negro) del
+// MODO_OPERACION 2, que los imprimen listos para pegar aquí.
+//
+// CÓMO MEDIRLAS BIEN (es donde falla el intento clásico):
+//   - BLANCO: papel blanco MATE o una tapa blanca, puesto en el electroimán,
+//     a la MISMA altura exacta a la que se van a leer las tapas. Si se usa
+//     algo brillante/satinado, la luz se refleja en espejo y se va del
+//     sensor: da MENOS señal que una tapa de color y la calibración queda al
+//     revés. Eso fue lo que pasó la vez pasada; no es que el método no
+//     sirva, es que la muestra blanca era especular o estaba más lejos.
+//   - NEGRO: tapa negra mate a la misma altura, o simplemente tapando el
+//     sensor con la mano para que no le llegue luz. Mide el piso de cada
+//     canal (el TCS3200 saca una frecuencia pequeña incluso a oscuras).
+//
+// No son const a propósito: en MODO_OPERACION 2 los comandos 'CB'/'CN' las
+// sobreescriben EN VIVO, así que apenas capturas el blanco y el negro la
+// impresión periódica ya sale balanceada y puedes comprobar el efecto en el
+// momento, sin recompilar ni volver a flashear. Lo que se pega abajo es solo
+// para que queden fijas en el firmware final.
+FirmaColorTCS3200 calBlanco = {0, 0, 0};
+FirmaColorTCS3200 calNegro  = {0, 0, 0};
+
 // !!! LOS VALORES DE ABAJO SON LOS ANTIGUOS Y HAY QUE REEMPLAZARLOS !!!
-// Normalizados dan casi el mismo punto los tres (r≈0.41, g≈0.29, b≈0.30:
-// menos de 1.5% de diferencia entre rojo y azul), o sea que no contienen
-// información de color: se tomaron a una altura donde el sensor no veía
-// realmente la tapa. Ese es el trabajo del MODO_OPERACION 2:
+// Con estos, el clasificador solo puede dar dos respuestas: AZUL (gana por
+// un pelo entre tres firmas prácticamente iguales) o DESCONOCIDO (cuando la
+// lectura queda fuera del umbral de las tres). Que es justo lo que se ve.
 //
 // CÓMO RECALIBRAR (MODO_OPERACION 2, ya activo):
 //   1. Sube el firmware y abre el monitor serial. El servo arranca arriba y
 //      el sensor imprime en vivo cada 500ms.
-//   2. Pon una tapa en el electroimán (arranca encendido; '0' lo apaga).
-//   3. Busca la altura: 'L' lleva el servo al ángulo de lectura actual, y
+//   2. Verifica que los LEDs blancos del módulo TCS3200 estén ENCENDIDOS. Si
+//      están apagados, el sensor solo ve la luz del cuarto y ningún ajuste
+//      de firmware lo va a arreglar.
+//   3. Pon una tapa en el electroimán (arranca encendido; '0' lo apaga).
+//   4. Busca la altura: 'L' lleva el servo al ángulo de lectura actual, y
 //      '+'/'-' lo ajustan de a pocos grados (siempre en rampa). También
 //      puedes escribir un ángulo directo, ej: "115".
 //      La altura BUENA es aquella en la que, al cambiar de tapa, los valores
-//      NORMALIZADOS (r,g,b) cambian claramente. Si al cambiar de tapa solo
-//      cambia la suma y no las proporciones, el sensor está demasiado lejos:
-//      baja más. Como referencia, el TCS3200 quiere estar a ~10-20mm.
-//   4. Con la altura elegida, pon la tapa ROJA y envía 'CR'; la VERDE y
-//      'CV'; la AZUL y 'CA'.
-//   5. Envía 'P': imprime las tres líneas const FIRMA_* listas para copiar
-//      y pegar aquí abajo, junto con la separación entre firmas.
-//   6. Pega los valores, y ajusta SERVO_ANGULO_LECTURA_COLOR al ángulo que
+//      NORMALIZADOS (norm r,g,b) cambian claramente. Si al cambiar de tapa
+//      solo cambia la suma y no las proporciones, el sensor está demasiado
+//      lejos: baja más. Como referencia, el TCS3200 quiere ~10-20mm.
+//   5. Con la altura ya fija, calibra el balance: blanco al frente -> 'CB';
+//      negro (o sensor tapado) -> 'CN'. A partir de ahí la impresión en vivo
+//      ya sale balanceada y se nota muchísimo más la diferencia entre tapas.
+//   6. Captura cada tapa: la ROJA -> 'CR', la VERDE -> 'CV', la AZUL -> 'CA'.
+//   7. Envía 'P': imprime calBlanco, calNegro y las tres firmas listas
+//      para copiar y pegar aquí, con el veredicto de separación.
+//   8. Pega los valores, y ajusta SERVO_ANGULO_LECTURA_COLOR al ángulo que
 //      elegiste (el mismo que reporta 'P').
-struct FirmaColorTCS3200 { uint32_t r, g, b; };
-const FirmaColorTCS3200 FIRMA_ROJO  = {5319, 3546, 3717};
-const FirmaColorTCS3200 FIRMA_VERDE = {4629, 3225, 3355};
-const FirmaColorTCS3200 FIRMA_AZUL  = {4444, 3144, 3236};
+//
+// Igual que calBlanco/calNegro, no son const: 'CR'/'CV'/'CA' las reemplazan
+// en vivo, así que después de capturar las tres puedes ir cambiando de tapa y
+// ver si el veredicto sale correcto ANTES de recompilar con los valores.
+FirmaColorTCS3200 firmaRojo  = {5319, 3546, 3717};
+FirmaColorTCS3200 firmaVerde = {4629, 3225, 3355};
+FirmaColorTCS3200 firmaAzul  = {4444, 3144, 3236};
 
 // --- Rechazo por lectura demasiado lejos de toda firma ---
 // Distancia cromática al cuadrado máxima para aceptar la clasificación. Las
@@ -813,24 +874,83 @@ LecturaColorTCS3200 leerCanalesTCS3200(int muestras) {
   return lectura;
 }
 
-// Coordenadas de cromaticidad: cada canal dividido por la suma de los tres,
-// así que siempre suman 1.0 y describen la PROPORCIÓN entre canales sin el
-// brillo total. Es lo que hace que la clasificación no dependa de la altura
-// del cabezal ni de la luz del cuarto (ver comentario de las FIRMA_*).
+// --- Paso 1 del pipeline: balance blanco/negro (quita el sesgo de canal) ---
+// Cada canal se reescala con SU PROPIA referencia: el blanco pasa a valer 1.0
+// y el negro 0.0 en los tres. Sin esto, el canal R sale alto siempre (los
+// fotodiodos rojos responden más y el LED no emite parejo) y ese sesgo fijo
+// tapa la señal de color, que es mucho más chica. Ver calBlanco/calNegro.
+struct ColorBalanceado { float r, g, b; };
+
+/**
+ * @brief ¿Hay una calibración blanco/negro utilizable? Exige que el blanco dé
+ * más que el negro en los TRES canales; con las referencias en {0,0,0} (sin
+ * calibrar) o con un blanco mal medido (especular, más lejos que las tapas,
+ * y por eso más oscuro que ellas) devuelve false y se sigue sin balance.
+ */
+bool balanceBlancoDisponible() {
+  return calBlanco.r > calNegro.r &&
+         calBlanco.g > calNegro.g &&
+         calBlanco.b > calNegro.b;
+}
+
+/**
+ * @brief Reescala un canal a 0.0 (negro de referencia) - 1.0 (blanco de
+ * referencia). Se recorta por abajo en 0 (una lectura más oscura que el negro
+ * es ruido, no un valor negativo) y por arriba en 4.0 solo como tope de
+ * seguridad: se permite pasar de 1.0 porque una tapa saturada en su canal
+ * puede reflejar más que el blanco de referencia, y recortarla justo en 1.0
+ * borraría precisamente la diferencia que interesa.
+ */
+float balancearCanal(uint32_t crudo, uint32_t negro, uint32_t blanco) {
+  float rango = (float)blanco - (float)negro;
+  if (rango <= 0.0) return 0.0;
+  return constrain(((float)crudo - (float)negro) / rango, 0.0f, 4.0f);
+}
+
+ColorBalanceado aplicarBalanceBlanco(uint32_t r, uint32_t g, uint32_t b) {
+  ColorBalanceado bal;
+  if (!balanceBlancoDisponible()) {
+    // Sin calibrar: se pasan los valores crudos tal cual. La cromaticidad de
+    // más abajo funciona igual (solo mira proporciones), simplemente sin la
+    // corrección del sesgo de canal.
+    bal.r = (float)r;
+    bal.g = (float)g;
+    bal.b = (float)b;
+    return bal;
+  }
+  bal.r = balancearCanal(r, calNegro.r, calBlanco.r);
+  bal.g = balancearCanal(g, calNegro.g, calBlanco.g);
+  bal.b = balancearCanal(b, calNegro.b, calBlanco.b);
+  return bal;
+}
+
+// --- Paso 2 del pipeline: cromaticidad (quita el brillo total) ---
+// Cada canal dividido por la suma de los tres, así que siempre suman 1.0 y
+// describen la PROPORCIÓN entre canales sin el brillo total. Es lo que hace
+// que la clasificación no dependa de la altura del cabezal ni de la luz del
+// cuarto (ver comentario de las FIRMA_*).
 struct CromaticidadColor { float r, g, b; };
 
-CromaticidadColor normalizarColor(uint32_t r, uint32_t g, uint32_t b) {
+CromaticidadColor normalizarColor(float r, float g, float b) {
   CromaticidadColor crom = {0.0, 0.0, 0.0};
-  float suma = (float)r + (float)g + (float)b;
+  float suma = r + g + b;
   if (suma <= 0.0) return crom; // sin señal: se deja en 0 y la clasificación lo descarta
-  crom.r = (float)r / suma;
-  crom.g = (float)g / suma;
-  crom.b = (float)b / suma;
+  crom.r = r / suma;
+  crom.g = g / suma;
+  crom.b = b / suma;
   return crom;
 }
 
-CromaticidadColor normalizarFirma(const FirmaColorTCS3200 &firma) {
-  return normalizarColor(firma.r, firma.g, firma.b);
+// --- Pipeline completo: crudo -> balance blanco/negro -> cromaticidad ---
+// Lo usan por igual la lectura del sensor y las firmas calibradas, así que
+// ambos lados se comparan siempre en la misma escala.
+CromaticidadColor cromaticidadDeCrudo(uint32_t r, uint32_t g, uint32_t b) {
+  ColorBalanceado bal = aplicarBalanceBlanco(r, g, b);
+  return normalizarColor(bal.r, bal.g, bal.b);
+}
+
+CromaticidadColor cromaticidadDeFirma(const FirmaColorTCS3200 &firma) {
+  return cromaticidadDeCrudo(firma.r, firma.g, firma.b);
 }
 
 /**
@@ -857,16 +977,25 @@ TipoColor clasificarLecturaColor(const LecturaColorTCS3200 &lectura) {
     return DESCONOCIDO;
   }
 
-  CromaticidadColor crom = normalizarColor(lectura.r, lectura.g, lectura.b);
+  ColorBalanceado bal = aplicarBalanceBlanco(lectura.r, lectura.g, lectura.b);
+  CromaticidadColor crom = normalizarColor(bal.r, bal.g, bal.b);
 
-  float dRojo  = distanciaCuadradaCromatica(crom, normalizarFirma(FIRMA_ROJO));
-  float dVerde = distanciaCuadradaCromatica(crom, normalizarFirma(FIRMA_VERDE));
-  float dAzul  = distanciaCuadradaCromatica(crom, normalizarFirma(FIRMA_AZUL));
+  float dRojo  = distanciaCuadradaCromatica(crom, cromaticidadDeFirma(firmaRojo));
+  float dVerde = distanciaCuadradaCromatica(crom, cromaticidadDeFirma(firmaVerde));
+  float dAzul  = distanciaCuadradaCromatica(crom, cromaticidadDeFirma(firmaAzul));
 
-  Serial.printf("[COLOR] raw R,G,B,C: %lu,%lu,%lu,%lu Hz | norm r,g,b: %.3f,%.3f,%.3f | dist2 ROJO:%.5f VERDE:%.5f AZUL:%.5f\n",
+  // Canal dominante tras el balance: diagnóstico independiente de las firmas.
+  // Con un balance blanco/negro bien hecho, una tapa roja DEBE dar 'R' aquí.
+  // Si el dominante no coincide con el color real de la tapa, el problema
+  // está en el balance o en la altura, no en las firmas.
+  char canalDominante = (crom.r >= crom.g && crom.r >= crom.b) ? 'R'
+                      : (crom.g >= crom.b) ? 'G' : 'B';
+
+  Serial.printf("[COLOR] raw R,G,B,C: %lu,%lu,%lu,%lu Hz | bal: %.3f,%.3f,%.3f%s | norm r,g,b: %.3f,%.3f,%.3f (dom:%c) | dist2 ROJO:%.5f VERDE:%.5f AZUL:%.5f\n",
                 (unsigned long)lectura.r, (unsigned long)lectura.g,
                 (unsigned long)lectura.b, (unsigned long)lectura.c,
-                crom.r, crom.g, crom.b, dRojo, dVerde, dAzul);
+                bal.r, bal.g, bal.b, balanceBlancoDisponible() ? "" : " (SIN CAL. BLANCO/NEGRO)",
+                crom.r, crom.g, crom.b, canalDominante, dRojo, dVerde, dAzul);
 
   float mejorDistancia = min(dRojo, min(dVerde, dAzul));
   if (mejorDistancia > UMBRAL_MAX_DIST_CROMATICA) {
@@ -893,15 +1022,22 @@ TipoColor obtenerColorTCS3200() {
 // ==========================================
 // 5.1 CARACTERIZACIÓN DEL SENSOR DE COLOR (solo MODO_OPERACION 2)
 // ==========================================
-// Firmas capturadas en vivo con 'CR'/'CV'/'CA'. Viven solo en RAM: 'P' las
-// imprime como código C para pegarlas arriba en FIRMA_ROJO/VERDE/AZUL y
-// dejarlas fijas en el firmware.
-FirmaColorTCS3200 firmaCapturada[3];       // índices: 0=ROJO, 1=VERDE, 2=AZUL
+// Las capturas escriben DIRECTAMENTE sobre las variables que usa el
+// clasificador (calBlanco/calNegro y firmaRojo/firmaVerde/firmaAzul), no
+// sobre una copia aparte. Así, apenas capturas algo, la impresión periódica
+// ya refleja el efecto: puedes capturar las tres tapas e ir cambiándolas para
+// comprobar que el veredicto sale bien ANTES de recompilar. 'P' imprime el
+// estado actual como código para dejarlo fijo en el firmware.
+FirmaColorTCS3200* const FIRMAS[3] = {&firmaRojo, &firmaVerde, &firmaAzul};
 bool firmaCapturadaValida[3] = {false, false, false};
 int anguloCapturaFirma[3] = {0, 0, 0};     // altura del servo a la que se tomó cada una
 
 const char* NOMBRE_FIRMA[3] = {"ROJO", "VERDE", "AZUL"};
 const char* COMANDO_FIRMA[3] = {"CR", "CV", "CA"};
+
+bool calBlancoValido = false;
+bool calNegroValido = false;
+int anguloCapturaBlanco = 0;
 
 void imprimirAyudaCalibracion() {
   Serial.println("--- Comandos ---");
@@ -912,17 +1048,93 @@ void imprimirAyudaCalibracion() {
   Serial.printf("  B / D       : ABAJO (%d grados)\n", SERVO_ANGULO_ABAJO);
   Serial.printf("  L           : angulo de LECTURA DE COLOR actual (%d grados)\n", SERVO_ANGULO_LECTURA_COLOR);
   Serial.println("  1 / 0       : electroiman ENCENDIDO / APAGADO");
-  Serial.println("  CR / CV / CA: captura la firma de la tapa ROJA / VERDE / AZUL a la altura actual");
-  Serial.println("  P           : imprime las firmas capturadas como codigo listo para pegar");
+  Serial.println("  CB / CN     : captura la referencia de BLANCO / NEGRO (balance de canales)");
+  Serial.println("  CR / CV / CA: captura la firma de la tapa ROJA / VERDE / AZUL");
+  Serial.println("  P           : imprime blanco, negro y firmas como codigo listo para pegar");
   Serial.println("  T           : pausa/reanuda la impresion continua del color");
   Serial.println("  ?           : vuelve a mostrar esta ayuda");
   Serial.println("--- Como calibrar ---");
+  Serial.println("  0) Revisa que los LEDs blancos del modulo TCS3200 esten ENCENDIDOS. Si estan");
+  Serial.println("     apagados el sensor solo ve la luz del cuarto y nada de esto va a funcionar.");
   Serial.println("  1) Pon una tapa en el electroiman y busca con '+'/'-' la altura donde los");
   Serial.println("     valores NORMALIZADOS (norm r,g,b) cambien claramente al cambiar de tapa.");
   Serial.println("     Si al cambiar de tapa solo cambia la suma cruda y no las proporciones,");
   Serial.println("     el sensor esta muy lejos: baja mas (el TCS3200 quiere ~10-20mm).");
-  Serial.println("  2) Con esa altura fija, captura cada tapa: CR (roja), CV (verde), CA (azul).");
-  Serial.println("  3) Envia 'P' y pega el resultado en las constantes FIRMA_* de main.cpp.");
+  Serial.println("  2) Con la altura ya fija, calibra el balance de canales: papel BLANCO MATE");
+  Serial.println("     al frente -> 'CB'; superficie NEGRA o sensor tapado -> 'CN'. Desde ese");
+  Serial.println("     momento la impresion sale balanceada y la diferencia entre tapas se nota");
+  Serial.println("     mucho mas: el blanco pasa a valer 1,1,1 y se va el sesgo del canal rojo.");
+  Serial.println("  3) Captura cada tapa: CR (roja), CV (verde), CA (azul).");
+  Serial.println("  4) Cambia de tapa y verifica en vivo que 'Veredicto' acierte en las tres.");
+  Serial.println("  5) Envia 'P' y pega el resultado en main.cpp.");
+}
+
+/**
+ * @brief Captura la referencia de BLANCO (comando 'CB'): la lectura de una
+ * superficie blanca mate puesta a la altura de trabajo. De aquí sale cuánto
+ * responde cada canal cuando los tres "deberían" dar lo mismo, que es el
+ * sesgo de canal a corregir.
+ */
+void capturarReferenciaBlanco() {
+  Serial.printf("[CAL BLANCO] Midiendo a %d grados (%d muestras). Pon una superficie BLANCA MATE\n",
+                anguloServoActual, TCS_MUESTRAS_CAPTURA_FIRMA);
+  Serial.println("[CAL BLANCO] a la misma altura a la que vas a leer las tapas (no brillante: si es");
+  Serial.println("[CAL BLANCO] satinada la luz se refleja en espejo y da menos senal que una tapa).");
+
+  LecturaColorTCS3200 lectura = leerCanalesTCS3200(TCS_MUESTRAS_CAPTURA_FIRMA);
+  if (lectura.r == 0 && lectura.g == 0 && lectura.b == 0) {
+    Serial.println("[CAL BLANCO] FALLO: sin senal en los 3 canales. Revisa el cableado del TCS3200.");
+    return;
+  }
+
+  calBlanco = {lectura.r, lectura.g, lectura.b};
+  calBlancoValido = true;
+  anguloCapturaBlanco = anguloServoActual;
+  Serial.printf("[CAL BLANCO] Guardado -> %lu,%lu,%lu Hz (clear:%lu)\n",
+                (unsigned long)lectura.r, (unsigned long)lectura.g,
+                (unsigned long)lectura.b, (unsigned long)lectura.c);
+  if (!calNegroValido) {
+    Serial.println("[CAL BLANCO] Falta el negro ('CN') para que el balance se active.");
+  }
+}
+
+/**
+ * @brief Captura la referencia de NEGRO (comando 'CN'): el piso de cada canal
+ * sin luz reflejada. El TCS3200 saca una frecuencia pequeña incluso a
+ * oscuras, y restarla es lo que hace que el 0 sea un 0 real en los tres.
+ */
+void capturarReferenciaNegro() {
+  Serial.printf("[CAL NEGRO] Midiendo a %d grados (%d muestras). Pon una superficie NEGRA MATE a la\n",
+                anguloServoActual, TCS_MUESTRAS_CAPTURA_FIRMA);
+  Serial.println("[CAL NEGRO] misma altura, o simplemente tapa el sensor con la mano.");
+
+  LecturaColorTCS3200 lectura = leerCanalesTCS3200(TCS_MUESTRAS_CAPTURA_FIRMA);
+  calNegro = {lectura.r, lectura.g, lectura.b};
+  calNegroValido = true;
+  Serial.printf("[CAL NEGRO] Guardado -> %lu,%lu,%lu Hz (clear:%lu)\n",
+                (unsigned long)lectura.r, (unsigned long)lectura.g,
+                (unsigned long)lectura.b, (unsigned long)lectura.c);
+
+  if (!calBlancoValido) {
+    Serial.println("[CAL NEGRO] Falta el blanco ('CB') para que el balance se active.");
+    return;
+  }
+
+  // balanceBlancoDisponible() ya mira exactamente esta condición sobre las
+  // variables vivas, así que aquí solo se explica el porqué cuando falla.
+  if (!balanceBlancoDisponible()) {
+    Serial.println("[CAL] OJO: el blanco NO da mas que el negro en los 3 canales, asi que el balance");
+    Serial.println("[CAL] queda invalido y se sigue ignorando. Suele ser blanco brillante (la luz se");
+    Serial.println("[CAL] refleja en espejo y se va del sensor) o medido mas lejos que el negro:");
+    Serial.println("[CAL] repite 'CB' con papel blanco MATE a la misma altura que las tapas.");
+    return;
+  }
+
+  Serial.printf("[CAL] Balance ACTIVO. Rango util por canal (blanco-negro): R:%ld G:%ld B:%ld\n",
+                (long)calBlanco.r - (long)calNegro.r,
+                (long)calBlanco.g - (long)calNegro.g,
+                (long)calBlanco.b - (long)calNegro.b);
+  Serial.println("[CAL] Ahora vuelve a poner cada tapa y captura sus firmas (CR/CV/CA).");
 }
 
 /**
@@ -939,15 +1151,16 @@ void capturarFirmaColor(int indice) {
     return;
   }
 
-  firmaCapturada[indice] = {lectura.r, lectura.g, lectura.b};
+  *FIRMAS[indice] = {lectura.r, lectura.g, lectura.b};
   firmaCapturadaValida[indice] = true;
   anguloCapturaFirma[indice] = anguloServoActual;
 
-  CromaticidadColor crom = normalizarColor(lectura.r, lectura.g, lectura.b);
-  Serial.printf("[CAPTURA] %s guardado -> crudo %lu,%lu,%lu Hz (clear:%lu) | norm %.3f,%.3f,%.3f\n",
+  CromaticidadColor crom = cromaticidadDeCrudo(lectura.r, lectura.g, lectura.b);
+  Serial.printf("[CAPTURA] %s guardado -> crudo %lu,%lu,%lu Hz (clear:%lu) | norm %.3f,%.3f,%.3f%s\n",
                 NOMBRE_FIRMA[indice],
                 (unsigned long)lectura.r, (unsigned long)lectura.g, (unsigned long)lectura.b,
-                (unsigned long)lectura.c, crom.r, crom.g, crom.b);
+                (unsigned long)lectura.c, crom.r, crom.g, crom.b,
+                balanceBlancoDisponible() ? "" : " (SIN BALANCE: captura antes CB y CN)");
 }
 
 /**
@@ -975,25 +1188,39 @@ void imprimirFirmasCapturadas() {
     Serial.println("[FIRMAS] son comparables si las 3 se toman a la MISMA altura. Recomendado: repetirlas.");
   }
 
-  Serial.println("=== PEGA ESTO EN main.cpp (reemplaza las constantes FIRMA_*) ===");
-  Serial.printf("const FirmaColorTCS3200 FIRMA_ROJO  = {%lu, %lu, %lu};\n",
-                (unsigned long)firmaCapturada[0].r, (unsigned long)firmaCapturada[0].g, (unsigned long)firmaCapturada[0].b);
-  Serial.printf("const FirmaColorTCS3200 FIRMA_VERDE = {%lu, %lu, %lu};\n",
-                (unsigned long)firmaCapturada[1].r, (unsigned long)firmaCapturada[1].g, (unsigned long)firmaCapturada[1].b);
-  Serial.printf("const FirmaColorTCS3200 FIRMA_AZUL  = {%lu, %lu, %lu};\n",
-                (unsigned long)firmaCapturada[2].r, (unsigned long)firmaCapturada[2].g, (unsigned long)firmaCapturada[2].b);
+  Serial.println("=== PEGA ESTO EN main.cpp (reemplaza calBlanco/calNegro y las firmas) ===");
+  if (calBlancoValido && calNegroValido) {
+    Serial.printf("FirmaColorTCS3200 calBlanco = {%lu, %lu, %lu};\n",
+                  (unsigned long)calBlanco.r, (unsigned long)calBlanco.g, (unsigned long)calBlanco.b);
+    Serial.printf("FirmaColorTCS3200 calNegro  = {%lu, %lu, %lu};\n",
+                  (unsigned long)calNegro.r, (unsigned long)calNegro.g, (unsigned long)calNegro.b);
+  } else {
+    Serial.println("// (sin balance blanco/negro: captura 'CB' y 'CN' y vuelve a enviar 'P')");
+  }
+  Serial.printf("FirmaColorTCS3200 firmaRojo  = {%lu, %lu, %lu};\n",
+                (unsigned long)firmaRojo.r, (unsigned long)firmaRojo.g, (unsigned long)firmaRojo.b);
+  Serial.printf("FirmaColorTCS3200 firmaVerde = {%lu, %lu, %lu};\n",
+                (unsigned long)firmaVerde.r, (unsigned long)firmaVerde.g, (unsigned long)firmaVerde.b);
+  Serial.printf("FirmaColorTCS3200 firmaAzul  = {%lu, %lu, %lu};\n",
+                (unsigned long)firmaAzul.r, (unsigned long)firmaAzul.g, (unsigned long)firmaAzul.b);
   if (mismaAltura) {
     Serial.printf("const int SERVO_ANGULO_LECTURA_COLOR = %d;  // altura usada en esta calibracion\n",
                   anguloCapturaFirma[0]);
   }
-  Serial.println("================================================================");
+  Serial.println("========================================================================");
+
+  if (!balanceBlancoDisponible()) {
+    Serial.println("[FIRMAS] AVISO: estas firmas se tomaron SIN balance blanco/negro activo. Es la");
+    Serial.println("[FIRMAS] causa mas probable de que los tres colores queden pegados: sin balance,");
+    Serial.println("[FIRMAS] el canal R domina siempre y tapa la diferencia real de color.");
+  }
 
   Serial.println("--- Separacion entre firmas (distancia cromatica al cuadrado) ---");
   float peorSeparacion = -1.0;
   for (int i = 0; i < 3; i++) {
     for (int j = i + 1; j < 3; j++) {
-      float d = distanciaCuadradaCromatica(normalizarFirma(firmaCapturada[i]),
-                                           normalizarFirma(firmaCapturada[j]));
+      float d = distanciaCuadradaCromatica(cromaticidadDeFirma(*FIRMAS[i]),
+                                           cromaticidadDeFirma(*FIRMAS[j]));
       Serial.printf("  %s vs %s: %.5f\n", NOMBRE_FIRMA[i], NOMBRE_FIRMA[j], d);
       if (peorSeparacion < 0.0 || d < peorSeparacion) peorSeparacion = d;
     }
@@ -1001,8 +1228,9 @@ void imprimirFirmasCapturadas() {
   Serial.printf("  Peor separacion: %.5f | umbral de decision: %.5f\n",
                 peorSeparacion, UMBRAL_MAX_DIST_CROMATICA);
   if (peorSeparacion < UMBRAL_MAX_DIST_CROMATICA) {
-    Serial.println("  VEREDICTO: MALA. Hay dos firmas mas cerca entre si que el umbral: a esta altura");
-    Serial.println("  el sensor no distingue esos dos colores. Baja mas el servo y vuelve a capturar.");
+    Serial.println("  VEREDICTO: MALA. Hay dos firmas mas cerca entre si que el umbral: asi no se");
+    Serial.println("  distinguen esos dos colores. Si aun no calibraste blanco/negro, hazlo (CB/CN)");
+    Serial.println("  y recaptura; si ya esta, baja mas el servo y vuelve a intentar.");
   } else if (peorSeparacion < UMBRAL_MAX_DIST_CROMATICA * 4) {
     Serial.println("  VEREDICTO: JUSTA. Deberia funcionar, pero con poco margen ante cambios de luz.");
     Serial.println("  Si puedes, prueba otra altura a ver si separa mas.");
@@ -1477,6 +1705,10 @@ void loop() {
         moverServoCalibracion(SERVO_ANGULO_ABAJO);
       } else if (linea.equalsIgnoreCase("L")) {
         moverServoCalibracion(SERVO_ANGULO_LECTURA_COLOR);
+      } else if (linea.equalsIgnoreCase("CB")) {
+        capturarReferenciaBlanco();
+      } else if (linea.equalsIgnoreCase("CN")) {
+        capturarReferenciaNegro();
       } else if (linea.equalsIgnoreCase("CR")) {
         capturarFirmaColor(0);
       } else if (linea.equalsIgnoreCase("CV")) {
