@@ -135,7 +135,7 @@ FLUJO DEL SISTEMA:
 // --- Posiciones de Servomotor ---
 const int SERVO_ANGULO_ARRIBA = 90;   // Cabezal levantado (seguro)
 const int SERVO_ANGULO_ABAJO  = 8;   // Cabezal abajo (agarre)
-const int SERVO_ANGULO_LECTURA_COLOR = 120;  // Altura calibrada para que el TCS3200 lea bien el objeto agarrado
+const int SERVO_ANGULO_LECTURA_COLOR = 120;  // Altura a la que se tomaron las firmas de color (FIRMA_ROJO/VERDE/AZUL); si se cambia, hay que recalibrar
 
 // --- Rampa del servo al levantar con el objeto agarrado ---
 // Subir de golpe (write directo) puede lanzar/botar el objeto por la
@@ -239,7 +239,7 @@ const float VL53_RANGO_MAX_MM = 150.0;
 // Calibrado: con lectura cruda de 145mm, el offset de -30 dejaba el target
 // en 115mm, pero el objeto real estaba en 85mm (30mm antes) -> offset total
 // correcto: -60mm (145 - 60 = 85).
-const float VL53_OFFSET_MM = -75.0;
+const float VL53_OFFSET_MM = -60.0;
 
 // --- Radio de la tapa/objeto a recoger (en mm) ---
 // Las tapas son circulares: el escaneo encuentra el centro real en X y el
@@ -248,12 +248,20 @@ const float VL53_OFFSET_MM = -75.0;
 // le suma este radio para llegar al centro real en Y.
 const float RADIO_TAPA_MM = 15.0;
 
-// --- Tolerancia a lecturas fallidas seguidas durante el escaneo de un objeto ---
-// Mientras se recorre el objeto para hallar su punto de distancia mínima, no
-// toda lectura sale válida (ej. tapas azules/verdes reflejan peor el IR y dan
-// más RangeStatus distinto de 0, ver leerSensorDistancia). Se toleran hasta
-// esta cantidad de lecturas fallidas SEGUIDAS antes de asumir que ya se pasó
-// el objeto por completo.
+// --- Confirmación de mínimo local durante el escaneo de una tapa ---
+// Cuántas lecturas SEGUIDAS que no mejoran (no bajan) el mínimo actual hacen
+// falta para asumir que ya pasamos el punto más cercano de la tapa actual y
+// cortar el escaneo ahí (en vez de seguir de largo hacia una posible tapa
+// siguiente pegada). Muy bajo = puede cortar antes de tiempo por ruido de un
+// solo dato; muy alto = puede alcanzar a mezclarse con la siguiente tapa.
+const int UMBRAL_CONFIRMAR_MINIMO_ESCANEO = 3;
+
+// --- Tolerancia a lecturas fallidas seguidas durante el escaneo de una tapa ---
+// Mientras se busca el mínimo, no toda lectura sale válida (ej. tapas
+// azules/verdes reflejan peor el IR y dan más RangeStatus distinto de 0, ver
+// leerSensorDistancia). Se toleran hasta esta cantidad de lecturas fallidas
+// SEGUIDAS (sin ninguna detección) antes de asumir que la tapa ya se acabó
+// por quedar fuera de rango, no por ruido puntual.
 const int TOLERANCIA_PERDIDAS_ESCANEO = 4;
 
 // --- Pasos de X entre cada lectura del VL53L0X durante el escaneo ---
@@ -262,19 +270,28 @@ const int TOLERANCIA_PERDIDAS_ESCANEO = 4;
 // del escaneo entre lecturas.
 const int PASOS_ENTRE_LECTURAS_ESCANEO = 40;
 
-// --- Calibración del Sensor de Color TCS3200 (portado de sensorcolorMain.c) ---
-// Frecuencia (Hz) leída con una muestra BLANCA (max reflexión, mayor
-// frecuencia) y una NEGRA (min reflexión, menor frecuencia) frente al sensor,
-// con el filtro correspondiente activo. Para calibrar: imprime las
-// frecuencias crudas (freqRojo/freqVerde/freqAzul) con una tarjeta blanca y
-// luego una negra frente al sensor, y reemplaza estos valores. Los de abajo
-// son solo un punto de partida.
-#define TCS_RED_MIN     630UL
-#define TCS_RED_MAX    4000UL
-#define TCS_GREEN_MIN   630UL
-#define TCS_GREEN_MAX  4000UL
-#define TCS_BLUE_MIN    750UL
-#define TCS_BLUE_MAX   4700UL
+// --- Calibración del Sensor de Color TCS3200 (por vecino más cercano) ---
+// El método clásico (normalizar cada canal contra un blanco/negro de
+// referencia) asume que el blanco refleja limpiamente en las 3 bandas.
+// En este montaje eso no se cumplió: una muestra blanca dio MENOS señal
+// cruda que las tapas de color (probablemente reflexión especular de la
+// superficie blanca vs. difusa de las tapas de plástico mate), así que esa
+// calibración no discriminaba bien entre verde/azul/rojo.
+//
+// En vez de eso, se guarda la "huella" (R,G,B crudos) medida directamente
+// de cada tapa real, y se clasifica por la firma más cercana (distancia
+// euclidiana al cuadrado) a la lectura actual. No requiere blanco/negro de
+// referencia, solo que cada tapa dé una lectura repetible parecida a sí
+// misma.
+//
+// CÓMO RECALIBRAR: sube el firmware en MODO_OPERACION=2, envía "130" para
+// llevar el servo a SERVO_ANGULO_LECTURA_COLOR, pon cada tapa a la misma
+// distancia del sensor (con el electroimán encendido, como en el agarre
+// real) y anota la línea "[COLOR] ... (raw R,G,B Hz)" para cada una.
+struct FirmaColorTCS3200 { uint32_t r, g, b; };
+const FirmaColorTCS3200 FIRMA_ROJO  = {5319, 3546, 3717};
+const FirmaColorTCS3200 FIRMA_VERDE = {4629, 3225, 3355};
+const FirmaColorTCS3200 FIRMA_AZUL  = {4444, 3144, 3236};
 
 // ==========================================
 // 3. VARIABLES DE ESTADO Y OBJETOS
@@ -650,15 +667,15 @@ uint32_t medirFrecuenciaTCS3200(uint32_t timeoutUs) {
 }
 
 /**
- * @brief Mapea una frecuencia cruda al rango 0-255 usando los límites de
- * calibración (freqMin = muestra negra, freqMax = muestra blanca), saturando
- * en los extremos si la lectura se sale del rango calibrado. Portado de
- * normalize() en sensorcolorMain.c.
+ * @brief Distancia euclidiana al cuadrado entre una lectura cruda (R,G,B) y
+ * una firma de color calibrada. Se usa al cuadrado (sin raíz) porque solo
+ * importa cuál firma da la distancia menor, no su valor exacto.
  */
-uint8_t normalizarTCS3200(uint32_t freq, uint32_t freqMin, uint32_t freqMax) {
-  if (freq <= freqMin) return 0;
-  if (freq >= freqMax) return 255;
-  return (uint8_t)(((freq - freqMin) * 255UL) / (freqMax - freqMin));
+long distanciaCuadradaColor(uint32_t r, uint32_t g, uint32_t b, const FirmaColorTCS3200 &firma) {
+  long dr = (long)r - (long)firma.r;
+  long dg = (long)g - (long)firma.g;
+  long db = (long)b - (long)firma.b;
+  return dr * dr + dg * dg + db * db;
 }
 
 /**
@@ -693,18 +710,17 @@ TipoColor obtenerColorTCS3200() {
     return DESCONOCIDO;
   }
 
-  uint8_t r = normalizarTCS3200(freqRojo,  TCS_RED_MIN,   TCS_RED_MAX);
-  uint8_t g = normalizarTCS3200(freqVerde, TCS_GREEN_MIN, TCS_GREEN_MAX);
-  uint8_t b = normalizarTCS3200(freqAzul,  TCS_BLUE_MIN,  TCS_BLUE_MAX);
+  long dRojo  = distanciaCuadradaColor(freqRojo, freqVerde, freqAzul, FIRMA_ROJO);
+  long dVerde = distanciaCuadradaColor(freqRojo, freqVerde, freqAzul, FIRMA_VERDE);
+  long dAzul  = distanciaCuadradaColor(freqRojo, freqVerde, freqAzul, FIRMA_AZUL);
 
-  Serial.printf("[COLOR] R:%u G:%u B:%u (raw %lu,%lu,%lu Hz)\n",
-                r, g, b,
-                (unsigned long)freqRojo, (unsigned long)freqVerde, (unsigned long)freqAzul);
+  Serial.printf("[COLOR] raw R,G,B: %lu,%lu,%lu Hz | dist2 ROJO:%ld VERDE:%ld AZUL:%ld\n",
+                (unsigned long)freqRojo, (unsigned long)freqVerde, (unsigned long)freqAzul,
+                dRojo, dVerde, dAzul);
 
-  // El color predominante es el canal normalizado con mayor valor
-  // (a mayor frecuencia, mayor intensidad de reflexión en ese filtro).
-  if (r >= g && r >= b) return ROJO;
-  if (g >= r && g >= b) return VERDE;
+  // El color es el de la firma más cercana (menor distancia) a la lectura actual.
+  if (dRojo <= dVerde && dRojo <= dAzul) return ROJO;
+  if (dVerde <= dRojo && dVerde <= dAzul) return VERDE;
   return AZUL;
 }
 
@@ -1283,19 +1299,20 @@ void loop() {
         moverACoordenadas(POS_X_INICIO_ESCANEO, posicionActualY);
       }
 
-      // La tapa es redonda: mientras el carro X la recorre, la distancia Y
-      // medida traza un mínimo justo en el X que pasa por su centro (el
-      // punto de un círculo más cercano al sensor está en su diámetro). En
-      // vez de parar en el primer borde detectado (+ un offset fijo
-      // aproximado), se sigue escaneando hasta perder el objeto, y se usa el
-      // X/Y de la lectura de MENOR distancia como centro real: más preciso
-      // que cualquier offset fijo, y necesario para que el electroimán
-      // quede centrado.
+      // Busca el mínimo real de distancia (más preciso que "borde + radio"),
+      // pero por OBJETO, no global: mientras la distancia sigue bajando (o
+      // igualando) el mínimo visto, sigue siendo la misma tapa. En cuanto
+      // hay varias lecturas seguidas que YA NO mejoran el mínimo (empezó a
+      // subir = pasamos el punto más cercano de ESTA tapa), se corta ahí
+      // mismo -- así, si hay una segunda tapa pegada justo después (sin un
+      // hueco real de "sin detección"), no se sigue de largo mezclándolas:
+      // se corta por la subida antes de llegar a su propio mínimo.
       {
         bool objetoEnVista = false;
         long xEnMinimo = 0;
         long yMinimoPasos = 0;
         int lecturasFallidasSeguidas = 0;
+        int lecturasSinMejorarSeguidas = 0;
 
         while (posicionActualX < LIMITE_PASOS_X && estadoActual == ESTADO_ESCANEO) {
           // Dar varios pasos seguidos en X antes de volver a leer el sensor:
@@ -1320,12 +1337,19 @@ void loop() {
             if (!objetoEnVista || yCalculado < yMinimoPasos) {
               yMinimoPasos = yCalculado;
               xEnMinimo = posicionActualX;
+              lecturasSinMejorarSeguidas = 0;
+            } else {
+              lecturasSinMejorarSeguidas++;
             }
             objetoEnVista = true;
+
+            // Ya pasamos el punto más cercano de esta tapa: cortar aquí
+            // antes de que el escaneo siga hacia una posible tapa siguiente.
+            if (lecturasSinMejorarSeguidas >= UMBRAL_CONFIRMAR_MINIMO_ESCANEO) break;
           } else if (objetoEnVista) {
-            // Ya veníamos viendo el objeto: cuenta lecturas fallidas
-            // seguidas (tolerantes a ruido, ej. tapas azules/verdes que
-            // reflejan peor el IR) antes de asumir que ya lo pasamos.
+            // Sin detección, pero ya veníamos viendo el objeto: tolera
+            // ruido (ej. tapas azules/verdes reflejan peor el IR) antes de
+            // asumir que se acabó por falta de rango, no por subida.
             lecturasFallidasSeguidas++;
             if (lecturasFallidasSeguidas >= TOLERANCIA_PERDIDAS_ESCANEO) break;
           }
@@ -1335,7 +1359,7 @@ void loop() {
           long pasosRadioTapa = (long)(RADIO_TAPA_MM * PASOS_POR_MM);
           objetoDetectadoX = xEnMinimo;
           objetoDetectadoY = constrain(yMinimoPasos + pasosRadioTapa, 0, LIMITE_PASOS_Y);
-          Serial.printf("[DETECCION] Centro real (distancia minima) en X: %ld pasos (%.1f mm) | Y minimo: %.1f mm + radio %.1f mm -> objetivo agarre Y: %ld pasos (%.1f mm)!\n",
+          Serial.printf("[DETECCION] Minimo de esta tapa en X: %ld pasos (%.1f mm) | Y minimo: %.1f mm + radio %.1f mm -> objetivo agarre Y: %ld pasos (%.1f mm)!\n",
                         xEnMinimo, xEnMinimo / PASOS_POR_MM,
                         yMinimoPasos / PASOS_POR_MM, RADIO_TAPA_MM,
                         objetoDetectadoY, objetoDetectadoY / PASOS_POR_MM);
@@ -1385,8 +1409,12 @@ void loop() {
       Serial.println("[ACTUADOR] Electroimán ENCENDIDO.");
       delay(1000); // Dar un segundo para asegurar el acople magnético
 
-      // 3. Levanta el servomotor con el objeto agarrado (se mantiene arriba
-      // hasta ESTADO_DEPOSITAR: no se vuelve a tocar el servo entre aquí y ahí)
+      // 3. Levanta el servomotor con el objeto agarrado, directo a la altura
+      // de lectura de color (SERVO_ANGULO_LECTURA_COLOR), no a
+      // SERVO_ANGULO_ARRIBA: esa parada intermedia era innecesaria (120° es
+      // igual de seguro para moverse que 90°) y solo agregaba una segunda
+      // rampa de servo más adelante, con otra oportunidad de que el objeto
+      // se resbale. Se mantiene ahí hasta ESTADO_DEPOSITAR.
       //
       // Los drivers de los NEMA17 mantienen corriente de sostenimiento todo
       // el tiempo que están habilitados, incluso quietos, compitiendo por la
@@ -1398,7 +1426,7 @@ void loop() {
       // Además se sube en rampa (no de golpe) para no lanzar el objeto por
       // el arranque brusco del servo.
       digitalWrite(PIN_MOTOR_RESET, LOW);
-      moverServoGradual(SERVO_ANGULO_ARRIBA);
+      moverServoGradual(SERVO_ANGULO_LECTURA_COLOR);
       servoAbajoMQTT = false;
       delay(500); // Margen extra por si el servo quedó forcejeando al final de la rampa
       digitalWrite(PIN_MOTOR_RESET, HIGH);
@@ -1406,6 +1434,8 @@ void loop() {
 
       // 4. El sensor TCS3200 está anclado cerca del home de Y (no viaja con
       // el cabezal), así que hay que acercar el objeto hasta ahí para leerlo.
+      // El servo ya quedó a la altura correcta, así que al llegar puede leer
+      // de inmediato, sin un segundo movimiento de servo.
       moverACoordenadas(posicionActualX, POS_Y_LECTURA_COLOR);
       delay(300);
 
@@ -1417,11 +1447,12 @@ void loop() {
     // -------------------------------------------------------------
     case ESTADO_LORE_COLOR:
       Serial.println("[MAQUINA] Estado: LECTURA DE COLOR...");
-
-      // El objeto sigue agarrado (electroimán encendido): se baja en rampa
-      // a la altura calibrada para el TCS3200, no de golpe, para no botarlo.
-      moverServoGradual(SERVO_ANGULO_LECTURA_COLOR);
-      delay(300); // Asienta antes de leer
+      // El servo ya está en SERVO_ANGULO_LECTURA_COLOR desde ESTADO_AGARRE;
+      // no hace falta moverlo de nuevo aquí (el settle ya se hizo con el
+      // delay(300) tras el movimiento a POS_Y_LECTURA_COLOR en ESTADO_AGARRE).
+      // Espera extra antes de leer: le da tiempo al objeto/cabezal de
+      // asentarse del todo y a la iluminación de estabilizarse.
+      delay(2500);
 
       colorDetectado = obtenerColorTCS3200();
       publicarTelemetria();
