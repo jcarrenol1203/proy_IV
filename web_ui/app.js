@@ -28,6 +28,7 @@ let systemState = {
   y: 0,
   magnet: false,
   servo: 'ARRIBA',
+  servoDeg: null,
   color: 'DESCONOCIDO',
   distanceMm: 0,
   yFineOffsetMm: 0,
@@ -138,6 +139,7 @@ function handleTelemetryMessage(data) {
   if (data.y_mm !== undefined) systemState.y = parseFloat(data.y_mm);
   if (data.magnet !== undefined) systemState.magnet = Boolean(data.magnet);
   if (data.servo !== undefined) systemState.servo = data.servo;
+  if (data.servo_deg !== undefined) systemState.servoDeg = parseInt(data.servo_deg);
   if (data.color !== undefined) systemState.color = data.color;
   if (data.dist_mm !== undefined) systemState.distanceMm = data.dist_mm;
   if (data.y_fine_offset_mm !== undefined) systemState.yFineOffsetMm = parseFloat(data.y_fine_offset_mm);
@@ -196,14 +198,21 @@ function updateDashboardUI() {
   document.getElementById('count-green').textContent = systemState.counts.green;
   document.getElementById('count-blue').textContent = systemState.counts.blue;
 
-  // Sync Switches UI state if not actively dragging
-  const magnetSwitch = document.getElementById('switch-magnet');
-  magnetSwitch.checked = systemState.magnet;
+  // Read-only actuator state (el electroimán y el servo ya no se comandan
+  // desde la web: solo se reporta lo que hace el firmware)
+  const magnetIndicator = document.getElementById('magnet-state-value');
+  magnetIndicator.textContent = systemState.magnet ? '1' : '0';
+  magnetIndicator.className = 'state-indicator' + (systemState.magnet ? ' magnet-on' : '');
   document.getElementById('magnet-switch-text').textContent = systemState.magnet ? 'Activado (Imán ON)' : 'Desactivado (Imán OFF)';
 
-  const servoSwitch = document.getElementById('switch-servo');
-  servoSwitch.checked = (systemState.servo === 'ABAJO' || systemState.servo === 'DOWN');
-  document.getElementById('servo-switch-text').textContent = (systemState.servo === 'ABAJO' || systemState.servo === 'DOWN') ? 'Abajo (Contacto)' : 'Arriba (Elevado)';
+  const servoAbajo = (systemState.servo === 'ABAJO' || systemState.servo === 'DOWN');
+  const servoIndicator = document.getElementById('servo-state-value');
+  servoIndicator.textContent = systemState.servo;
+  servoIndicator.className = 'state-indicator' + (servoAbajo ? ' active' : '');
+  // El ángulo real solo aparece si el ESP32 lo publica (campo servo_deg)
+  const servoDegSuffix = (systemState.servoDeg !== null) ? ` — ${systemState.servoDeg}°` : '';
+  document.getElementById('servo-switch-text').textContent =
+    (servoAbajo ? 'Abajo (Contacto)' : 'Arriba (Elevado)') + servoDegSuffix;
 
   // Canvas positions
   document.getElementById('canvas-x').textContent = systemState.x.toFixed(1);
@@ -422,17 +431,9 @@ function initUIEventListeners() {
     sendCommand({ cmd: 'HOMING' });
   });
 
-  // Electromagnet Toggle Switch
-  document.getElementById('switch-magnet').addEventListener('change', (e) => {
-    const isChecked = e.target.checked;
-    sendCommand({ cmd: 'MAGNET', state: isChecked });
-  });
-
-  // Servo Height Toggle Switch
-  document.getElementById('switch-servo').addEventListener('change', (e) => {
-    const isChecked = e.target.checked;
-    sendCommand({ cmd: 'SERVO', state: isChecked ? 'DOWN' : 'UP' });
-  });
+  // El electroimán y la altura del cabezal ya no se comandan desde la web
+  // (los gobierna la máquina de estados del ESP32); su estado se muestra en
+  // updateDashboardUI() a partir de la telemetría, sin listeners.
 
   // Helper for Selected Step Size
   function getSelectedStepSize() {

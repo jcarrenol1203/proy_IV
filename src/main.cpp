@@ -26,17 +26,22 @@
 //     Serial ('1' = encender, '0' = apagar). No inicializa ni usa ningún
 //     otro pin (motores, servo, finales de carrera, VL53L0X, TCS3200), así
 //     que sirve con el ESP32 y el electroimán solos, sin nada más conectado.
-// 2 = Solo prueba el servomotor MG90S: lo mueve entre SERVO_ANGULO_ARRIBA y
-//     SERVO_ANGULO_ABAJO en bucle. No inicializa ni usa ningún otro pin
-//     (motores, electroimán, finales de carrera, VL53L0X, TCS3200), así que
-//     sirve con el ESP32 y el servo solos, sin nada más conectado.
+// 2 = MODO CALIBRACIÓN SERVO + SENSOR DE COLOR. Es el modo pensado para
+//     caracterizar el TCS3200: mueve el servo SIEMPRE en rampa (nunca de
+//     golpe) a cualquier ángulo que se le pida por Serial, y en paralelo
+//     imprime en vivo la lectura del sensor de color (crudo, normalizado y
+//     el veredicto de clasificación) a esa altura. Así se busca a mano la
+//     altura a la que el sensor discrimina bien y, ahí mismo, se capturan
+//     las firmas de cada tapa con 'CR'/'CV'/'CA' y se imprimen listas para
+//     pegar en el código con 'P'. Usa servo + TCS3200 + electroimán; no
+//     inicializa motores, finales de carrera ni VL53L0X.
 // 1 = Solo lee e imprime color (TCS3200) y distancia (VL53L0X) por Serial
 //     cada 2s, para verificar que ambos sensores funcionan. No usa ni
 //     configura los pines de motores/servo/electroimán/finales de carrera,
 //     así que sirve aunque solo tengas los sensores conectados.
 // 0 = Corre la máquina de estados completa del clasificador XY (requiere
 //     todo el hardware físicamente armado).
-#define MODO_OPERACION 0
+#define MODO_OPERACION 2
 
 // WiFi/MQTT (control remoto + app web) solo se compilan/inicializan en
 // MODO_OPERACION 0. Los modos de prueba 1-5 quedan exactamente igual que
@@ -137,15 +142,27 @@ const int SERVO_ANGULO_ARRIBA = 90;   // Cabezal levantado (seguro)
 const int SERVO_ANGULO_ABAJO  = 8;   // Cabezal abajo (agarre)
 const int SERVO_ANGULO_LECTURA_COLOR = 120;  // Altura a la que se tomaron las firmas de color (FIRMA_ROJO/VERDE/AZUL); si se cambia, hay que recalibrar
 
-// --- Rampa del servo al levantar con el objeto agarrado ---
-// Subir de golpe (write directo) puede lanzar/botar el objeto por la
-// aceleración repentina del cabezal. Moverlo en pasos pequeños con una
-// pausa entre cada uno sube el objeto de forma suave.
+// --- Rampa del servo (usada en TODOS los movimientos del cabezal) ---
+// Antes solo se subía en rampa y se bajaba con un write() directo. Ese salto
+// de golpe (ej. de 120° a 8°) hace que el MG90S pida su corriente de arranque
+// máxima de una sola vez, compitiendo con la corriente de sostenimiento de
+// los drivers NEMA17 en el mismo riel: la tensión se hunde y el servo se
+// queda a medio camino o directamente no baja. Moviéndolo en pasos pequeños
+// con una pausa entre cada uno el pico de corriente desaparece, el
+// movimiento es repetible y, con el objeto agarrado, no se lanza por la
+// aceleración repentina.
 const int SERVO_PASO_RAMPA_GRADOS = 5;
 const int SERVO_DELAY_PASO_RAMPA_MS = 25;
 
 // --- Paso de ajuste fino del servo en MODO_OPERACION 2 (grados por '+'/'-') ---
 const int SERVO_PASO_AJUSTE_GRADOS = 2;
+
+// --- Límites de recorrido permitidos al servo (grados) ---
+// Evita mandarlo contra su tope mecánico mientras se calibra a mano en
+// MODO_OPERACION 2 (forzarlo contra el tope lo hace consumir corriente
+// indefinidamente y calentarse).
+const int SERVO_ANGULO_MIN = 0;
+const int SERVO_ANGULO_MAX = 180;
 
 // --- Relación de transmisión (Pasos por milímetro) ---
 // PASOS_POR_MM = (pasos_motor_por_vuelta x microstepping) / (dientes_polea x paso_correa_mm)
@@ -270,28 +287,90 @@ const int TOLERANCIA_PERDIDAS_ESCANEO = 4;
 // del escaneo entre lecturas.
 const int PASOS_ENTRE_LECTURAS_ESCANEO = 40;
 
-// --- Calibración del Sensor de Color TCS3200 (por vecino más cercano) ---
+// --- Muestreo del TCS3200 ---
+// Tres detalles del muestreo que, mal puestos, arruinan la caracterización:
+//
+// 1. TCS_DELAY_CAMBIO_FILTRO_MS: al cambiar S2/S3 se conmuta a otro grupo de
+//    fotodiodos y la salida tarda un momento en estabilizarse en la nueva
+//    frecuencia. Sin esta pausa, el primer periodo que se mide es el de la
+//    transición (una mezcla del canal anterior y el nuevo), que es
+//    justamente lo que hace que los tres canales se parezcan entre sí.
+// 2. TCS_PERIODOS_POR_MUESTRA: medir UN solo periodo con pulseIn da una
+//    lectura muy ruidosa (±10% entre lecturas seguidas de la misma tapa).
+//    Se promedian varios periodos seguidos.
+// 3. TCS_MUESTRAS_POR_LECTURA: además, cada lectura RGB completa se repite y
+//    se promedia, para que la firma capturada sea repetible.
+const int TCS_DELAY_CAMBIO_FILTRO_MS = 3;
+const int TCS_PERIODOS_POR_MUESTRA   = 8;
+const int TCS_MUESTRAS_POR_LECTURA   = 5;
+
+// Muestras promediadas al CAPTURAR una firma en MODO_OPERACION 2 (comandos
+// 'CR'/'CV'/'CA'). Más alto que en operación normal: la firma se mide una
+// sola vez y de ella dependen todas las clasificaciones posteriores, así que
+// vale la pena gastar un par de segundos en promediarla bien.
+const int TCS_MUESTRAS_CAPTURA_FIRMA = 20;
+
+// --- Calibración del Sensor de Color TCS3200 (por cromaticidad normalizada) ---
 // El método clásico (normalizar cada canal contra un blanco/negro de
 // referencia) asume que el blanco refleja limpiamente en las 3 bandas.
 // En este montaje eso no se cumplió: una muestra blanca dio MENOS señal
-// cruda que las tapas de color (probablemente reflexión especular de la
-// superficie blanca vs. difusa de las tapas de plástico mate), así que esa
-// calibración no discriminaba bien entre verde/azul/rojo.
+// cruda que las tapas de color, así que esa calibración no discriminaba.
 //
-// En vez de eso, se guarda la "huella" (R,G,B crudos) medida directamente
-// de cada tapa real, y se clasifica por la firma más cercana (distancia
-// euclidiana al cuadrado) a la lectura actual. No requiere blanco/negro de
-// referencia, solo que cada tapa dé una lectura repetible parecida a sí
-// misma.
+// Se pasó entonces a guardar la "huella" (R,G,B crudos) de cada tapa real y
+// clasificar por la firma más cercana. Eso tampoco bastó, y por esto SIEMPRE
+// daba AZUL: comparando valores CRUDOS, la distancia está dominada por el
+// brillo total (cuánta luz vuelve al sensor), no por el color. El brillo
+// depende de la altura del cabezal, de la luz del cuarto y de lo sucia que
+// esté la tapa; entre las tres firmas antiguas la diferencia era casi
+// puramente de escala (R>B>G en las tres, ~12600 / ~11200 / ~10800 de suma),
+// así que cualquier lectura un poco más oscura de lo normal caía
+// automáticamente en la firma de menor suma -> AZUL, sin importar el color.
 //
-// CÓMO RECALIBRAR: sube el firmware en MODO_OPERACION=2, envía "130" para
-// llevar el servo a SERVO_ANGULO_LECTURA_COLOR, pon cada tapa a la misma
-// distancia del sensor (con el electroimán encendido, como en el agarre
-// real) y anota la línea "[COLOR] ... (raw R,G,B Hz)" para cada una.
+// La solución es clasificar por CROMATICIDAD: se divide cada canal por la
+// suma R+G+B, quedándose con las PROPORCIONES entre canales y descartando el
+// brillo total. Una tapa roja da r alto y b bajo tanto de cerca como de
+// lejos; lo que cambia con la distancia es la suma, que aquí se cancela.
+//
+// Las firmas se siguen guardando en crudo (es lo que imprime el sensor y lo
+// que se anota al calibrar); normalizarColor() las convierte a cromaticidad
+// en el momento de comparar.
+//
+// !!! LOS VALORES DE ABAJO SON LOS ANTIGUOS Y HAY QUE REEMPLAZARLOS !!!
+// Normalizados dan casi el mismo punto los tres (r≈0.41, g≈0.29, b≈0.30:
+// menos de 1.5% de diferencia entre rojo y azul), o sea que no contienen
+// información de color: se tomaron a una altura donde el sensor no veía
+// realmente la tapa. Ese es el trabajo del MODO_OPERACION 2:
+//
+// CÓMO RECALIBRAR (MODO_OPERACION 2, ya activo):
+//   1. Sube el firmware y abre el monitor serial. El servo arranca arriba y
+//      el sensor imprime en vivo cada 500ms.
+//   2. Pon una tapa en el electroimán (arranca encendido; '0' lo apaga).
+//   3. Busca la altura: 'L' lleva el servo al ángulo de lectura actual, y
+//      '+'/'-' lo ajustan de a pocos grados (siempre en rampa). También
+//      puedes escribir un ángulo directo, ej: "115".
+//      La altura BUENA es aquella en la que, al cambiar de tapa, los valores
+//      NORMALIZADOS (r,g,b) cambian claramente. Si al cambiar de tapa solo
+//      cambia la suma y no las proporciones, el sensor está demasiado lejos:
+//      baja más. Como referencia, el TCS3200 quiere estar a ~10-20mm.
+//   4. Con la altura elegida, pon la tapa ROJA y envía 'CR'; la VERDE y
+//      'CV'; la AZUL y 'CA'.
+//   5. Envía 'P': imprime las tres líneas const FIRMA_* listas para copiar
+//      y pegar aquí abajo, junto con la separación entre firmas.
+//   6. Pega los valores, y ajusta SERVO_ANGULO_LECTURA_COLOR al ángulo que
+//      elegiste (el mismo que reporta 'P').
 struct FirmaColorTCS3200 { uint32_t r, g, b; };
 const FirmaColorTCS3200 FIRMA_ROJO  = {5319, 3546, 3717};
 const FirmaColorTCS3200 FIRMA_VERDE = {4629, 3225, 3355};
 const FirmaColorTCS3200 FIRMA_AZUL  = {4444, 3144, 3236};
+
+// --- Rechazo por lectura demasiado lejos de toda firma ---
+// Distancia cromática al cuadrado máxima para aceptar la clasificación. Las
+// coordenadas de cromaticidad suman 1, así que 0.010 equivale a ~0.10 de
+// distancia euclidiana repartida entre los 3 canales: una lectura que no se
+// parece a ninguna tapa calibrada (sin objeto, tapa de otro color, sensor
+// tapado) cae fuera y se reporta DESCONOCIDO en vez de inventar un color.
+// Súbelo si tras recalibrar salen DESCONOCIDO lecturas que sí son válidas.
+const float UMBRAL_MAX_DIST_CROMATICA = 0.010;
 
 // ==========================================
 // 3. VARIABLES DE ESTADO Y OBJETOS
@@ -299,6 +378,12 @@ const FirmaColorTCS3200 FIRMA_AZUL  = {4444, 3144, 3236};
 Servo miServo;
 Adafruit_VL53L0X sensorDistancia = Adafruit_VL53L0X();
 bool vl53Disponible = false;
+
+// Último ángulo ordenado al servo. Se lleva aparte en vez de usar
+// miServo.read() (que reconstruye el ángulo desde el ancho de pulso y puede
+// devolver 1-2 grados de diferencia) para que la rampa arranque siempre
+// exactamente donde terminó la anterior.
+int anguloServoActual = SERVO_ANGULO_ARRIBA;
 
 // Estados de la Máquina de Estados
 enum EstadoSistema {
@@ -586,20 +671,23 @@ void imprimirZonas() {
 }
 
 /**
- * @brief Mueve el servo en pasos pequeños (SERVO_PASO_RAMPA_GRADOS) con una
- * pausa entre cada uno, en vez de saltar de golpe al ángulo destino. Se usa
- * al levantar con el objeto ya agarrado: el frenazo/arranque brusco de un
- * write() directo puede lanzarlo fuera del electroimán.
+ * @brief Mueve el servo hasta anguloDestino en pasos de
+ * SERVO_PASO_RAMPA_GRADOS con una pausa entre cada uno, en vez de saltar de
+ * golpe. Se usa en TODOS los movimientos del cabezal, subiendo y bajando:
+ * bajando evita el pico de corriente que dejaba al servo sin llegar abajo, y
+ * subiendo con el objeto agarrado evita que el arranque brusco lo lance
+ * fuera del electroimán. Ver comentario de SERVO_PASO_RAMPA_GRADOS.
  */
 void moverServoGradual(int anguloDestino) {
-  int anguloActual = miServo.read(); // último ángulo escrito (sin sensor de posición real)
-  int paso = (anguloDestino >= anguloActual) ? SERVO_PASO_RAMPA_GRADOS : -SERVO_PASO_RAMPA_GRADOS;
+  anguloDestino = constrain(anguloDestino, SERVO_ANGULO_MIN, SERVO_ANGULO_MAX);
+  int paso = (anguloDestino >= anguloServoActual) ? SERVO_PASO_RAMPA_GRADOS : -SERVO_PASO_RAMPA_GRADOS;
 
-  for (int a = anguloActual; (paso > 0) ? (a < anguloDestino) : (a > anguloDestino); a += paso) {
+  for (int a = anguloServoActual; (paso > 0) ? (a < anguloDestino) : (a > anguloDestino); a += paso) {
     miServo.write(a);
     delay(SERVO_DELAY_PASO_RAMPA_MS);
   }
   miServo.write(anguloDestino);
+  anguloServoActual = anguloDestino;
 }
 
 // ==========================================
@@ -648,81 +736,281 @@ bool leerSensorDistancia(long &pasosYCalculados) {
 }
 
 /**
- * @brief Mide la frecuencia (Hz) de la señal OUT del TCS3200 sumando la
- * duración del semiciclo alto y bajo (equivale a un periodo completo entre
- * dos flancos de subida). Es el equivalente en Arduino/ESP32 (pulseIn) de
+ * @brief Mide la frecuencia (Hz) de la señal OUT del TCS3200 promediando
+ * TCS_PERIODOS_POR_MUESTRA periodos seguidos. Cada periodo se arma sumando la
+ * duración del semiciclo alto y el bajo (equivale al tiempo entre dos flancos
+ * de subida). Es el equivalente en Arduino/ESP32 (pulseIn) de
  * measure_frequency() en sensorcolorMain.c, que usaba Input Capture por
  * hardware (TIM2) en el STM32.
+ *
+ * Promediar varios periodos (en vez de quedarse con uno solo, como antes) es
+ * lo que hace que dos lecturas seguidas de la misma tapa den prácticamente el
+ * mismo número: con un solo periodo el ruido era comparable a la diferencia
+ * entre colores.
+ *
  * @param timeoutUs Tiempo máximo de espera por flanco, en microsegundos.
- * @return Frecuencia en Hz, o 0 si no hubo pulso (timeout).
+ * @return Frecuencia en Hz, o 0 si no hubo ningún pulso (timeout).
  */
 uint32_t medirFrecuenciaTCS3200(uint32_t timeoutUs) {
-  unsigned long alto = pulseIn(TCS_OUT, HIGH, timeoutUs);
-  if (alto == 0) return 0;
-  unsigned long bajo = pulseIn(TCS_OUT, LOW, timeoutUs);
-  if (bajo == 0) return 0;
+  unsigned long sumaPeriodos = 0;
+  int periodosValidos = 0;
 
-  unsigned long periodo = alto + bajo; // en microsegundos
-  return (uint32_t)(1000000UL / periodo);
+  for (int i = 0; i < TCS_PERIODOS_POR_MUESTRA; i++) {
+    unsigned long alto = pulseIn(TCS_OUT, HIGH, timeoutUs);
+    if (alto == 0) continue;
+    unsigned long bajo = pulseIn(TCS_OUT, LOW, timeoutUs);
+    if (bajo == 0) continue;
+    sumaPeriodos += alto + bajo; // en microsegundos
+    periodosValidos++;
+  }
+
+  if (periodosValidos == 0) return 0;
+  unsigned long periodoPromedio = sumaPeriodos / periodosValidos;
+  if (periodoPromedio == 0) return 0;
+  return (uint32_t)(1000000UL / periodoPromedio);
 }
 
 /**
- * @brief Distancia euclidiana al cuadrado entre una lectura cruda (R,G,B) y
- * una firma de color calibrada. Se usa al cuadrado (sin raíz) porque solo
- * importa cuál firma da la distancia menor, no su valor exacto.
+ * @brief Selecciona un canal del TCS3200 con S2/S3, espera a que la salida se
+ * estabilice en el nuevo fotodiodo y mide su frecuencia.
+ *
+ * Filtros (S2, S3): Rojo LOW/LOW | Verde HIGH/HIGH | Azul LOW/HIGH |
+ * Clear (sin filtro, luz total) HIGH/LOW.
  */
-long distanciaCuadradaColor(uint32_t r, uint32_t g, uint32_t b, const FirmaColorTCS3200 &firma) {
-  long dr = (long)r - (long)firma.r;
-  long dg = (long)g - (long)firma.g;
-  long db = (long)b - (long)firma.b;
+uint32_t medirCanalTCS3200(int s2, int s3) {
+  const uint32_t TIMEOUT_US = 20000; // 20ms
+  digitalWrite(TCS_S2, s2);
+  digitalWrite(TCS_S3, s3);
+  delay(TCS_DELAY_CAMBIO_FILTRO_MS); // sin esto se mide la transición entre canales
+  return medirFrecuenciaTCS3200(TIMEOUT_US);
+}
+
+// Lectura completa del sensor: los 3 canales de color + el canal "clear"
+// (luz total sin filtro). Clear no se usa para clasificar, pero al calibrar
+// dice de un vistazo si está llegando luz suficiente al sensor: si es bajo,
+// el cabezal está demasiado lejos de la tapa.
+struct LecturaColorTCS3200 { uint32_t r, g, b, c; };
+
+/**
+ * @brief Lee los 4 canales del TCS3200 promediando muestras completas.
+ * @param muestras Cuántas lecturas RGBC completas promediar.
+ */
+LecturaColorTCS3200 leerCanalesTCS3200(int muestras) {
+  uint32_t sumaR = 0, sumaG = 0, sumaB = 0, sumaC = 0;
+
+  for (int i = 0; i < muestras; i++) {
+    sumaR += medirCanalTCS3200(LOW, LOW);
+    sumaG += medirCanalTCS3200(HIGH, HIGH);
+    sumaB += medirCanalTCS3200(LOW, HIGH);
+    sumaC += medirCanalTCS3200(HIGH, LOW);
+  }
+
+  LecturaColorTCS3200 lectura;
+  lectura.r = sumaR / muestras;
+  lectura.g = sumaG / muestras;
+  lectura.b = sumaB / muestras;
+  lectura.c = sumaC / muestras;
+  return lectura;
+}
+
+// Coordenadas de cromaticidad: cada canal dividido por la suma de los tres,
+// así que siempre suman 1.0 y describen la PROPORCIÓN entre canales sin el
+// brillo total. Es lo que hace que la clasificación no dependa de la altura
+// del cabezal ni de la luz del cuarto (ver comentario de las FIRMA_*).
+struct CromaticidadColor { float r, g, b; };
+
+CromaticidadColor normalizarColor(uint32_t r, uint32_t g, uint32_t b) {
+  CromaticidadColor crom = {0.0, 0.0, 0.0};
+  float suma = (float)r + (float)g + (float)b;
+  if (suma <= 0.0) return crom; // sin señal: se deja en 0 y la clasificación lo descarta
+  crom.r = (float)r / suma;
+  crom.g = (float)g / suma;
+  crom.b = (float)b / suma;
+  return crom;
+}
+
+CromaticidadColor normalizarFirma(const FirmaColorTCS3200 &firma) {
+  return normalizarColor(firma.r, firma.g, firma.b);
+}
+
+/**
+ * @brief Distancia euclidiana al cuadrado entre dos puntos de cromaticidad.
+ * Se usa al cuadrado (sin raíz) porque solo importa cuál firma da la
+ * distancia menor, no su valor exacto.
+ */
+float distanciaCuadradaCromatica(const CromaticidadColor &a, const CromaticidadColor &b) {
+  float dr = a.r - b.r;
+  float dg = a.g - b.g;
+  float db = a.b - b.b;
   return dr * dr + dg * dg + db * db;
 }
 
 /**
- * @brief Lee el sensor TCS3200 (R, G, B) y determina el color predominante.
- * @return TipoColor (ROJO, VERDE o AZUL)
+ * @brief Clasifica una lectura ya tomada contra las firmas calibradas,
+ * comparando cromaticidad (no valores crudos), e imprime el detalle.
+ * @return ROJO/VERDE/AZUL de la firma más cercana, o DESCONOCIDO si no hubo
+ * señal o si ninguna firma queda dentro de UMBRAL_MAX_DIST_CROMATICA.
  */
-TipoColor obtenerColorTCS3200() {
-  // Configuración de filtros del TCS3200 (S2, S3):
-  // Rojo: S2 = LOW, S3 = LOW
-  // Verde: S2 = HIGH, S3 = HIGH
-  // Azul: S2 = LOW, S3 = HIGH
-  const uint32_t TIMEOUT_US = 20000; // 20ms
-
-  // 1. Leer Componente Roja
-  digitalWrite(TCS_S2, LOW);
-  digitalWrite(TCS_S3, LOW);
-  uint32_t freqRojo = medirFrecuenciaTCS3200(TIMEOUT_US);
-
-  // 2. Leer Componente Verde
-  digitalWrite(TCS_S2, HIGH);
-  digitalWrite(TCS_S3, HIGH);
-  uint32_t freqVerde = medirFrecuenciaTCS3200(TIMEOUT_US);
-
-  // 3. Leer Componente Azul
-  digitalWrite(TCS_S2, LOW);
-  digitalWrite(TCS_S3, HIGH);
-  uint32_t freqAzul = medirFrecuenciaTCS3200(TIMEOUT_US);
-
-  // Si no hubo pulso en ningún canal, el sensor no está viendo nada válido
-  if (freqRojo == 0 && freqVerde == 0 && freqAzul == 0) {
+TipoColor clasificarLecturaColor(const LecturaColorTCS3200 &lectura) {
+  if (lectura.r == 0 && lectura.g == 0 && lectura.b == 0) {
     Serial.println("[COLOR] Sin lectura (timeout en los 3 canales).");
     return DESCONOCIDO;
   }
 
-  long dRojo  = distanciaCuadradaColor(freqRojo, freqVerde, freqAzul, FIRMA_ROJO);
-  long dVerde = distanciaCuadradaColor(freqRojo, freqVerde, freqAzul, FIRMA_VERDE);
-  long dAzul  = distanciaCuadradaColor(freqRojo, freqVerde, freqAzul, FIRMA_AZUL);
+  CromaticidadColor crom = normalizarColor(lectura.r, lectura.g, lectura.b);
 
-  Serial.printf("[COLOR] raw R,G,B: %lu,%lu,%lu Hz | dist2 ROJO:%ld VERDE:%ld AZUL:%ld\n",
-                (unsigned long)freqRojo, (unsigned long)freqVerde, (unsigned long)freqAzul,
-                dRojo, dVerde, dAzul);
+  float dRojo  = distanciaCuadradaCromatica(crom, normalizarFirma(FIRMA_ROJO));
+  float dVerde = distanciaCuadradaCromatica(crom, normalizarFirma(FIRMA_VERDE));
+  float dAzul  = distanciaCuadradaCromatica(crom, normalizarFirma(FIRMA_AZUL));
+
+  Serial.printf("[COLOR] raw R,G,B,C: %lu,%lu,%lu,%lu Hz | norm r,g,b: %.3f,%.3f,%.3f | dist2 ROJO:%.5f VERDE:%.5f AZUL:%.5f\n",
+                (unsigned long)lectura.r, (unsigned long)lectura.g,
+                (unsigned long)lectura.b, (unsigned long)lectura.c,
+                crom.r, crom.g, crom.b, dRojo, dVerde, dAzul);
+
+  float mejorDistancia = min(dRojo, min(dVerde, dAzul));
+  if (mejorDistancia > UMBRAL_MAX_DIST_CROMATICA) {
+    Serial.printf("[COLOR] Lectura lejos de toda firma (mejor dist2:%.5f > umbral:%.5f) -> DESCONOCIDO\n",
+                  mejorDistancia, UMBRAL_MAX_DIST_CROMATICA);
+    return DESCONOCIDO;
+  }
 
   // El color es el de la firma más cercana (menor distancia) a la lectura actual.
-  if (dRojo <= dVerde && dRojo <= dAzul) return ROJO;
-  if (dVerde <= dRojo && dVerde <= dAzul) return VERDE;
+  if (mejorDistancia == dRojo) return ROJO;
+  if (mejorDistancia == dVerde) return VERDE;
   return AZUL;
 }
+
+/**
+ * @brief Lee el sensor TCS3200 y determina el color predominante.
+ * @return TipoColor (ROJO, VERDE, AZUL o DESCONOCIDO)
+ */
+TipoColor obtenerColorTCS3200() {
+  return clasificarLecturaColor(leerCanalesTCS3200(TCS_MUESTRAS_POR_LECTURA));
+}
+
+#if MODO_OPERACION == 2
+// ==========================================
+// 5.1 CARACTERIZACIÓN DEL SENSOR DE COLOR (solo MODO_OPERACION 2)
+// ==========================================
+// Firmas capturadas en vivo con 'CR'/'CV'/'CA'. Viven solo en RAM: 'P' las
+// imprime como código C para pegarlas arriba en FIRMA_ROJO/VERDE/AZUL y
+// dejarlas fijas en el firmware.
+FirmaColorTCS3200 firmaCapturada[3];       // índices: 0=ROJO, 1=VERDE, 2=AZUL
+bool firmaCapturadaValida[3] = {false, false, false};
+int anguloCapturaFirma[3] = {0, 0, 0};     // altura del servo a la que se tomó cada una
+
+const char* NOMBRE_FIRMA[3] = {"ROJO", "VERDE", "AZUL"};
+const char* COMANDO_FIRMA[3] = {"CR", "CV", "CA"};
+
+void imprimirAyudaCalibracion() {
+  Serial.println("--- Comandos ---");
+  Serial.printf("  +           : sube %d grados (en rampa)\n", SERVO_PASO_AJUSTE_GRADOS);
+  Serial.printf("  -           : baja %d grados (en rampa)\n", SERVO_PASO_AJUSTE_GRADOS);
+  Serial.println("  <numero>    : va directo a ese angulo (0-180), tambien en rampa. Ej: 115");
+  Serial.printf("  A / U       : ARRIBA (%d grados)\n", SERVO_ANGULO_ARRIBA);
+  Serial.printf("  B / D       : ABAJO (%d grados)\n", SERVO_ANGULO_ABAJO);
+  Serial.printf("  L           : angulo de LECTURA DE COLOR actual (%d grados)\n", SERVO_ANGULO_LECTURA_COLOR);
+  Serial.println("  1 / 0       : electroiman ENCENDIDO / APAGADO");
+  Serial.println("  CR / CV / CA: captura la firma de la tapa ROJA / VERDE / AZUL a la altura actual");
+  Serial.println("  P           : imprime las firmas capturadas como codigo listo para pegar");
+  Serial.println("  T           : pausa/reanuda la impresion continua del color");
+  Serial.println("  ?           : vuelve a mostrar esta ayuda");
+  Serial.println("--- Como calibrar ---");
+  Serial.println("  1) Pon una tapa en el electroiman y busca con '+'/'-' la altura donde los");
+  Serial.println("     valores NORMALIZADOS (norm r,g,b) cambien claramente al cambiar de tapa.");
+  Serial.println("     Si al cambiar de tapa solo cambia la suma cruda y no las proporciones,");
+  Serial.println("     el sensor esta muy lejos: baja mas (el TCS3200 quiere ~10-20mm).");
+  Serial.println("  2) Con esa altura fija, captura cada tapa: CR (roja), CV (verde), CA (azul).");
+  Serial.println("  3) Envia 'P' y pega el resultado en las constantes FIRMA_* de main.cpp.");
+}
+
+/**
+ * @brief Toma una lectura larga y promediada de la tapa que esté puesta y la
+ * guarda como firma del color indicado (índice 0=ROJO, 1=VERDE, 2=AZUL).
+ */
+void capturarFirmaColor(int indice) {
+  Serial.printf("[CAPTURA] Midiendo firma de %s a %d grados (%d muestras, no muevas la tapa)...\n",
+                NOMBRE_FIRMA[indice], anguloServoActual, TCS_MUESTRAS_CAPTURA_FIRMA);
+
+  LecturaColorTCS3200 lectura = leerCanalesTCS3200(TCS_MUESTRAS_CAPTURA_FIRMA);
+  if (lectura.r == 0 && lectura.g == 0 && lectura.b == 0) {
+    Serial.println("[CAPTURA] FALLO: sin senal en los 3 canales. Revisa el cableado del TCS3200.");
+    return;
+  }
+
+  firmaCapturada[indice] = {lectura.r, lectura.g, lectura.b};
+  firmaCapturadaValida[indice] = true;
+  anguloCapturaFirma[indice] = anguloServoActual;
+
+  CromaticidadColor crom = normalizarColor(lectura.r, lectura.g, lectura.b);
+  Serial.printf("[CAPTURA] %s guardado -> crudo %lu,%lu,%lu Hz (clear:%lu) | norm %.3f,%.3f,%.3f\n",
+                NOMBRE_FIRMA[indice],
+                (unsigned long)lectura.r, (unsigned long)lectura.g, (unsigned long)lectura.b,
+                (unsigned long)lectura.c, crom.r, crom.g, crom.b);
+}
+
+/**
+ * @brief Imprime las firmas capturadas como código C listo para pegar, más un
+ * informe de qué tan separadas quedaron entre sí. Esa separación es la que
+ * decide si la calibración va a servir: si dos firmas quedan más cerca entre
+ * ellas que UMBRAL_MAX_DIST_CROMATICA, el sensor no las va a poder distinguir
+ * de forma confiable y hay que volver a buscar altura.
+ */
+void imprimirFirmasCapturadas() {
+  bool faltaAlguna = false;
+  for (int i = 0; i < 3; i++) {
+    if (!firmaCapturadaValida[i]) {
+      Serial.printf("[FIRMAS] Falta capturar %s (comando '%s').\n", NOMBRE_FIRMA[i], COMANDO_FIRMA[i]);
+      faltaAlguna = true;
+    }
+  }
+  if (faltaAlguna) return;
+
+  bool mismaAltura = (anguloCapturaFirma[0] == anguloCapturaFirma[1] &&
+                      anguloCapturaFirma[1] == anguloCapturaFirma[2]);
+  if (!mismaAltura) {
+    Serial.printf("[FIRMAS] OJO: se capturaron a alturas distintas (%d, %d, %d grados). Las firmas solo\n",
+                  anguloCapturaFirma[0], anguloCapturaFirma[1], anguloCapturaFirma[2]);
+    Serial.println("[FIRMAS] son comparables si las 3 se toman a la MISMA altura. Recomendado: repetirlas.");
+  }
+
+  Serial.println("=== PEGA ESTO EN main.cpp (reemplaza las constantes FIRMA_*) ===");
+  Serial.printf("const FirmaColorTCS3200 FIRMA_ROJO  = {%lu, %lu, %lu};\n",
+                (unsigned long)firmaCapturada[0].r, (unsigned long)firmaCapturada[0].g, (unsigned long)firmaCapturada[0].b);
+  Serial.printf("const FirmaColorTCS3200 FIRMA_VERDE = {%lu, %lu, %lu};\n",
+                (unsigned long)firmaCapturada[1].r, (unsigned long)firmaCapturada[1].g, (unsigned long)firmaCapturada[1].b);
+  Serial.printf("const FirmaColorTCS3200 FIRMA_AZUL  = {%lu, %lu, %lu};\n",
+                (unsigned long)firmaCapturada[2].r, (unsigned long)firmaCapturada[2].g, (unsigned long)firmaCapturada[2].b);
+  if (mismaAltura) {
+    Serial.printf("const int SERVO_ANGULO_LECTURA_COLOR = %d;  // altura usada en esta calibracion\n",
+                  anguloCapturaFirma[0]);
+  }
+  Serial.println("================================================================");
+
+  Serial.println("--- Separacion entre firmas (distancia cromatica al cuadrado) ---");
+  float peorSeparacion = -1.0;
+  for (int i = 0; i < 3; i++) {
+    for (int j = i + 1; j < 3; j++) {
+      float d = distanciaCuadradaCromatica(normalizarFirma(firmaCapturada[i]),
+                                           normalizarFirma(firmaCapturada[j]));
+      Serial.printf("  %s vs %s: %.5f\n", NOMBRE_FIRMA[i], NOMBRE_FIRMA[j], d);
+      if (peorSeparacion < 0.0 || d < peorSeparacion) peorSeparacion = d;
+    }
+  }
+  Serial.printf("  Peor separacion: %.5f | umbral de decision: %.5f\n",
+                peorSeparacion, UMBRAL_MAX_DIST_CROMATICA);
+  if (peorSeparacion < UMBRAL_MAX_DIST_CROMATICA) {
+    Serial.println("  VEREDICTO: MALA. Hay dos firmas mas cerca entre si que el umbral: a esta altura");
+    Serial.println("  el sensor no distingue esos dos colores. Baja mas el servo y vuelve a capturar.");
+  } else if (peorSeparacion < UMBRAL_MAX_DIST_CROMATICA * 4) {
+    Serial.println("  VEREDICTO: JUSTA. Deberia funcionar, pero con poco margen ante cambios de luz.");
+    Serial.println("  Si puedes, prueba otra altura a ver si separa mas.");
+  } else {
+    Serial.println("  VEREDICTO: BUENA. Los tres colores quedan bien separados a esta altura.");
+  }
+}
+#endif // MODO_OPERACION == 2
 
 #if MODO_OPERACION == 0
 // ==========================================
@@ -765,6 +1053,7 @@ void publicarTelemetria() {
   doc["y_mm"] = posicionActualY / PASOS_POR_MM;
   doc["magnet"] = electroimanEstadoMQTT;
   doc["servo"] = servoAbajoMQTT ? "ABAJO" : "ARRIBA";
+  doc["servo_deg"] = anguloServoActual;
   doc["dist_mm"] = ultimaDistanciaMmMQTT;
   doc["y_fine_offset_mm"] = ajusteFinoYMm;
   doc["color"] = getColorNombre(colorDetectado);
@@ -809,12 +1098,14 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
     digitalWrite(PIN_MOSFET_MAG, state ? HIGH : LOW);
     Serial.printf("[ELECTROIMAN] Control manual (MQTT): %s\n", state ? "ENCENDIDO" : "APAGADO");
   } else if (strcmp(cmd, "SERVO") == 0) {
+    // La app web ya no expone este control (solo muestra la posición), pero
+    // se deja disponible para cualquier otro cliente MQTT.
     const char* sState = doc["state"];
     if (sState && (strcmp(sState, "DOWN") == 0 || strcmp(sState, "ABAJO") == 0)) {
-      miServo.write(SERVO_ANGULO_ABAJO);
+      moverServoGradual(SERVO_ANGULO_ABAJO);
       servoAbajoMQTT = true;
     } else {
-      miServo.write(SERVO_ANGULO_ARRIBA);
+      moverServoGradual(SERVO_ANGULO_ARRIBA);
       servoAbajoMQTT = false;
     }
   } else if (strcmp(cmd, "MOVE") == 0 && doc["x"].is<float>() && doc["y"].is<float>()) {
@@ -949,12 +1240,11 @@ void setup() {
 #endif
 
 #if MODO_OPERACION == 2
-  Serial.println("=== MODO PRUEBA: SERVOMOTOR MG90S (AJUSTE INTERACTIVO) + LECTURA DE COLOR ===");
-  Serial.printf("Comandos: '+' sube %d grados, '-' baja %d grados, un numero (0-180) va directo a ese angulo, 'A' = ARRIBA (%d), 'B' = ABAJO (%d), '1' enciende el electroiman, '0' lo apaga.\n",
-                SERVO_PASO_AJUSTE_GRADOS, SERVO_PASO_AJUSTE_GRADOS, SERVO_ANGULO_ARRIBA, SERVO_ANGULO_ABAJO);
-  Serial.println("El color leido por el TCS3200 se imprime solo cada cierto tiempo, para calibrar a que altura del servo lee bien.");
+  Serial.println("=== MODO CALIBRACION: SERVO (RAMPA) + SENSOR DE COLOR TCS3200 ===");
+  imprimirAyudaCalibracion();
   miServo.attach(PIN_SERVO);
   miServo.write(SERVO_ANGULO_ARRIBA); // Empezar con el cabezal arriba
+  anguloServoActual = SERVO_ANGULO_ARRIBA;
   Serial.printf("[SERVO] -> %d grados\n", SERVO_ANGULO_ARRIBA);
 
   // --- Configuración del Sensor de Color (para calibrar altura junto al servo) ---
@@ -1005,6 +1295,7 @@ void setup() {
 
   miServo.attach(PIN_SERVO);
   miServo.write(SERVO_ANGULO_ARRIBA); // Empezar con el cabezal arriba
+  anguloServoActual = SERVO_ANGULO_ARRIBA;
 
   // --- Configuración de Sensores ---
   pinMode(PIN_LIMIT_X, INPUT_PULLUP);
@@ -1147,11 +1438,23 @@ void loop() {
 
 #elif MODO_OPERACION == 2
 // ==========================================
-// AJUSTE INTERACTIVO DEL SERVOMOTOR MG90S POR SERIAL (+ LECTURA DE COLOR)
+// CALIBRACIÓN INTERACTIVA: SERVO EN RAMPA + CARACTERIZACIÓN DEL TCS3200
 // ==========================================
-int anguloServoActual = SERVO_ANGULO_ARRIBA;
+// La idea del modo: el servo se mueve SIEMPRE con moverServoGradual() (misma
+// rampa que usa la máquina de estados real, así que la altura que se calibre
+// aquí es exactamente la que va a alcanzar en operación), y el sensor imprime
+// en vivo lo que ve a esa altura. Cuando la altura discrimina bien, se
+// capturan las tres firmas y se imprimen listas para pegar en el código.
 unsigned long ultimaLecturaColorMs = 0;
 const unsigned long INTERVALO_LECTURA_COLOR_MS = 500;
+bool impresionColorActiva = true;
+
+void moverServoCalibracion(int anguloDestino) {
+  int anguloAnterior = anguloServoActual;
+  moverServoGradual(anguloDestino);
+  Serial.printf("[SERVO] %d -> %d grados (rampa de %d en %d grados)\n",
+                anguloAnterior, anguloServoActual, SERVO_DELAY_PASO_RAMPA_MS, SERVO_PASO_RAMPA_GRADOS);
+}
 
 void loop() {
   if (Serial.available() > 0) {
@@ -1165,50 +1468,54 @@ void loop() {
         digitalWrite(PIN_MOSFET_MAG, LOW);
         Serial.println("[ELECTROIMAN] APAGADO");
       } else if (linea == "+") {
-        anguloServoActual += SERVO_PASO_AJUSTE_GRADOS;
-        anguloServoActual = constrain(anguloServoActual, 0, 180);
-        miServo.write(anguloServoActual);
-        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+        moverServoCalibracion(anguloServoActual + SERVO_PASO_AJUSTE_GRADOS);
       } else if (linea == "-") {
-        anguloServoActual -= SERVO_PASO_AJUSTE_GRADOS;
-        anguloServoActual = constrain(anguloServoActual, 0, 180);
-        miServo.write(anguloServoActual);
-        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
-      } else if (linea.equalsIgnoreCase("A")) {
-        anguloServoActual = SERVO_ANGULO_ARRIBA;
-        miServo.write(anguloServoActual);
-        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
-      } else if (linea.equalsIgnoreCase("B")) {
-        anguloServoActual = SERVO_ANGULO_ABAJO;
-        miServo.write(anguloServoActual);
-        Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+        moverServoCalibracion(anguloServoActual - SERVO_PASO_AJUSTE_GRADOS);
+      } else if (linea.equalsIgnoreCase("A") || linea.equalsIgnoreCase("U")) {
+        moverServoCalibracion(SERVO_ANGULO_ARRIBA);
+      } else if (linea.equalsIgnoreCase("B") || linea.equalsIgnoreCase("D")) {
+        moverServoCalibracion(SERVO_ANGULO_ABAJO);
+      } else if (linea.equalsIgnoreCase("L")) {
+        moverServoCalibracion(SERVO_ANGULO_LECTURA_COLOR);
+      } else if (linea.equalsIgnoreCase("CR")) {
+        capturarFirmaColor(0);
+      } else if (linea.equalsIgnoreCase("CV")) {
+        capturarFirmaColor(1);
+      } else if (linea.equalsIgnoreCase("CA")) {
+        capturarFirmaColor(2);
+      } else if (linea.equalsIgnoreCase("P")) {
+        imprimirFirmasCapturadas();
+      } else if (linea.equalsIgnoreCase("T")) {
+        impresionColorActiva = !impresionColorActiva;
+        Serial.printf("[COLOR] Impresion continua %s.\n", impresionColorActiva ? "REANUDADA" : "PAUSADA");
+      } else if (linea == "?") {
+        imprimirAyudaCalibracion();
       } else {
-        bool esNumero = linea.length() > 0;
+        bool esNumero = true;
         for (unsigned int i = 0; i < linea.length() && esNumero; i++) {
           char c = linea.charAt(i);
           if (!isDigit(c) && !(i == 0 && c == '-')) esNumero = false;
         }
         if (!esNumero) {
-          Serial.println("[ERROR] Comando invalido. Usa '+', '-', un angulo (0-180), 'A' (arriba), 'B' (abajo), '1'/'0' (electroiman).");
+          Serial.println("[ERROR] Comando invalido. Envia '?' para ver la lista de comandos.");
         } else {
-          anguloServoActual = constrain(linea.toInt(), 0, 180);
-          miServo.write(anguloServoActual);
-          Serial.printf("[SERVO] -> %d grados\n", anguloServoActual);
+          moverServoCalibracion(linea.toInt());
         }
       }
     }
   }
 
   // Lectura de color periódica (no bloqueada por los comandos del servo),
-  // para ver en vivo cómo cambia el color leído según la altura del servo.
-  if (millis() - ultimaLecturaColorMs >= INTERVALO_LECTURA_COLOR_MS) {
+  // para ver en vivo cómo cambia lo que ve el sensor según la altura.
+  // clasificarLecturaColor() ya imprime crudo + normalizado + distancias.
+  if (impresionColorActiva && millis() - ultimaLecturaColorMs >= INTERVALO_LECTURA_COLOR_MS) {
     ultimaLecturaColorMs = millis();
-    TipoColor color = obtenerColorTCS3200();
+    TipoColor color = clasificarLecturaColor(leerCanalesTCS3200(TCS_MUESTRAS_POR_LECTURA));
     const char *nombreColor = (color == ROJO) ? "ROJO"
                             : (color == VERDE) ? "VERDE"
                             : (color == AZUL) ? "AZUL"
-                            : "SIN LECTURA";
-    Serial.printf("[SERVO %d grados] Color: %s\n", anguloServoActual, nombreColor);
+                            : "SIN LECTURA / DESCONOCIDO";
+    Serial.printf("[SERVO %d grados] Veredicto: %s\n", anguloServoActual, nombreColor);
   }
 }
 
@@ -1278,7 +1585,7 @@ void loop() {
       // Aseguramos que el electroimán esté apagado y el servo arriba antes del home
       digitalWrite(PIN_MOSFET_MAG, LOW);
       electroimanEstadoMQTT = false;
-      miServo.write(SERVO_ANGULO_ARRIBA);
+      moverServoGradual(SERVO_ANGULO_ARRIBA);
       servoAbajoMQTT = false;
       delay(500);
 
@@ -1398,10 +1705,20 @@ void loop() {
     case ESTADO_AGARRE:
       Serial.println("[MAQUINA] Estado: AGARRE Y ACOPLE...");
 
-      // 1. Baja el servomotor para acercar el electroimán al objeto
-      miServo.write(SERVO_ANGULO_ABAJO);
+      // 1. Baja el servomotor para acercar el electroimán al objeto.
+      // En rampa y con los drivers de los motores dormidos, por la misma
+      // razón que al subir (ver punto 3): un write() directo desde 120° hasta
+      // 8° pedía toda la corriente de arranque del servo de una vez mientras
+      // los NEMA17 seguían consumiendo su corriente de sostenimiento en el
+      // mismo riel, y el servo se quedaba a medio bajar o no bajaba. Los ejes
+      // ya están en su sitio y quietos, así que soltarles la corriente
+      // mientras baja el cabezal no mueve nada.
+      digitalWrite(PIN_MOTOR_RESET, LOW);
+      moverServoGradual(SERVO_ANGULO_ABAJO);
       servoAbajoMQTT = true;
-      delay(1000); // Esperar a que el servo llegue abajo
+      delay(500); // Margen para que el servo asiente al final de la rampa
+      digitalWrite(PIN_MOTOR_RESET, HIGH);
+      delay(10); // Pequeño margen para que los drivers se reactiven
 
       // 2. Activa el Electroimán
       digitalWrite(PIN_MOSFET_MAG, HIGH);
@@ -1513,10 +1830,14 @@ void loop() {
 
       // Baja el servo para depositar. El objeto sigue agarrado (electroimán
       // aún encendido) y viene de SERVO_ANGULO_LECTURA_COLOR (120°), un salto
-      // más grande que antes, así que se baja en rampa para no botarlo.
+      // grande, así que se baja en rampa y con los drivers dormidos para no
+      // botarlo ni hundir la alimentación (igual que en ESTADO_AGARRE).
+      digitalWrite(PIN_MOTOR_RESET, LOW);
       moverServoGradual(SERVO_ANGULO_ABAJO);
       servoAbajoMQTT = true;
       delay(500);
+      digitalWrite(PIN_MOTOR_RESET, HIGH);
+      delay(10);
 
       // Desactivar el Electroimán para soltar el objeto
       digitalWrite(PIN_MOSFET_MAG, LOW);
@@ -1524,8 +1845,10 @@ void loop() {
       Serial.println("[ACTUADOR] Electroimán APAGADO. Objeto liberado.");
       delay(1000); // Esperar a que caiga
 
-      // Volver a subir el cabezal vacío
-      miServo.write(SERVO_ANGULO_ARRIBA);
+      // Volver a subir el cabezal vacío (también en rampa: aunque ya no lleva
+      // objeto, el salto de golpe sigue siendo el pico de corriente que
+      // conviene evitar)
+      moverServoGradual(SERVO_ANGULO_ARRIBA);
       servoAbajoMQTT = false;
       delay(500);
 

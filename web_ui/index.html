@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <!-- MQTT.js Client Library over WebSocket -->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
-  <link rel="stylesheet" href="style.css?v=3">
+  <link rel="stylesheet" href="style.css?v=4">
 </head>
 <body>
 
@@ -177,32 +177,27 @@
         </div>
       </div>
 
-      <!-- Manual Electromagnet Control -->
+      <!-- Electromagnet & Head State (read-only: los controla el firmware) -->
       <div class="control-block highlighted-block">
-        <h2><i class="fa-solid fa-magnet"></i> Control Manual del Electroimán y Cabezal</h2>
-        
+        <h2><i class="fa-solid fa-magnet"></i> Estado del Electroimán y Cabezal</h2>
+        <p class="calib-hint">Solo lectura: el electroimán y la altura del cabezal los gobierna la máquina de estados del ESP32 durante el ciclo de agarre.</p>
+
         <div class="toggle-switches-grid">
-          <!-- Electromagnet Switch -->
+          <!-- Electromagnet State -->
           <div class="toggle-card">
             <div class="toggle-header">
               <i class="fa-solid fa-bolt"></i> Electroimán
             </div>
-            <label class="switch">
-              <input type="checkbox" id="switch-magnet">
-              <span class="slider round"></span>
-            </label>
-            <span class="toggle-status" id="magnet-switch-text">Desactivado</span>
+            <span class="state-indicator" id="magnet-state-value">0</span>
+            <span class="toggle-status" id="magnet-switch-text">Desactivado (Imán OFF)</span>
           </div>
 
-          <!-- Servo Height Switch -->
+          <!-- Servo Height State -->
           <div class="toggle-card">
             <div class="toggle-header">
               <i class="fa-solid fa-arrows-up-down"></i> Altura Cabezal (Servo)
             </div>
-            <label class="switch">
-              <input type="checkbox" id="switch-servo">
-              <span class="slider round"></span>
-            </label>
+            <span class="state-indicator" id="servo-state-value">ARRIBA</span>
             <span class="toggle-status" id="servo-switch-text">Arriba (Elevado)</span>
           </div>
         </div>
@@ -305,6 +300,6 @@
     <p>Proyecto Clasificador de Objetos por Color XY &copy; 2026 - Conexión MQTT en tiempo real</p>
   </footer>
 
-  <script src="app.js?v=4"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

@@ -39,9 +39,11 @@ La interfaz web está construida con **HTML5, Vanilla CSS y JS con MQTT.js sobre
 - **Efecto de Escaneo:** Muestra un barrido láser animado en cian cuando la máquina está en modo **ESCANEO**.
 - **Cajas de Almacenamiento:** Muestra las 3 zonas (Rojo, Verde, Azul) en la franja $X = 0 \text{ a } 50\text{mm}$ con contador de objetos depositados.
 
-### B. Control Manual del Electroimán y Cabezal
-- **Interruptor Electroimán:** Permite encender o apagar el imán MOSFET en tiempo real.
-- **Interruptor Altura Cabezal (Servo):** Permite subir (90°) o bajar (10°) el servomotor para agarre manual.
+### B. Estado del Electroimán y Cabezal (solo lectura)
+- **Electroimán:** Indicador `1` / `0` con el estado real del imán MOSFET. Ya **no** se puede encender/apagar desde la web: lo gobierna la máquina de estados del ESP32 durante el ciclo de agarre.
+- **Altura Cabezal (Servo):** Indicador `ARRIBA` / `ABAJO` con el ángulo actual en grados. Tampoco se comanda desde la web; el servo se mueve siempre en rampa desde el firmware.
+
+### B.2 Posicionamiento Manual (Ejes X / Y)
 - **D-Pad de Movimiento:** Botones **X+**, **X-**, **Y+**, **Y-** para desplazar el cabezal.
 - **Selector de Paso:** Elige la distancia por clic: `1mm`, `5mm`, `10mm` o `50mm`.
 - **Ir a Coordenadas (X, Y):** Escribe posiciones numéricas exactas en milímetros y presiona **Mover a Coordenada**.
